@@ -1,0 +1,22 @@
+{
+  "name": "fantasy-atlas",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "手描きの輪郭から架空の地形・河川・国家を生成する地図エディタ",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "fflate": "^0.8.3"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5",
+    "vitest": "^5.0.5"
+  }
+}

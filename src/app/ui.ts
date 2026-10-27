@@ -1,0 +1,885 @@
+import { CULTURES, FEATURE_LABEL, cultureByKey } from '../core/names';
+import { decodeWorld } from '../core/serialize';
+import { randomSeed } from '../core/rng';
+import type { Feature } from '../core/landforms';
+import * as actions from './actions';
+import { fmtArea, fmtKm, h, sliderRow } from './dom';
+import { buildMapPng, downloadBytes, maxExportScale, politicalGeoJSON, readWorldFromFile, safeFilename, thumbnail } from './exporter';
+import { icon } from './icons';
+import { featureDisplayName } from './labels';
+import type { LayerFlags, MapRenderer } from './renderer';
+import { AUTOSAVE_ID, deleteMap, listMaps, loadMap, newMapId, saveMap } from './storage';
+import type { Store, ViewMode } from './store';
+import { GROUP_LABEL, TOOLS, type ToolId, type ToolSettings } from './tools';
+
+export interface UiHost {
+  store: Store;
+  renderer: MapRenderer;
+  getTool: () => ToolId;
+  setTool: (t: ToolId) => void;
+  settings: ToolSettings;
+  getMode: () => ViewMode;
+  setMode: (m: ViewMode) => void;
+  flags: LayerFlags;
+  requestDraw: () => void;
+  fit: () => void;
+  zoom: (f: number) => void;
+  focusOn: (x: number, y: number, radiusCells: number) => void;
+}
+
+type Tab = 'tool' | 'generate' | 'data' | 'features';
+
+/** 画面の DOM 部分（上部バー・ツールバー・パネル・ダイアログ） */
+export class AppUI {
+  readonly root: HTMLElement;
+  readonly mapWrap: HTMLElement;
+  readonly canvas: HTMLCanvasElement;
+  private toolbar: HTMLElement;
+  private panel: HTMLElement;
+  private panelBody: HTMLElement;
+  private tabsEl: HTMLElement;
+  private hintEl: HTMLElement;
+  private busyEl: HTMLElement;
+  private staleEl: HTMLElement;
+  private undoBtn!: HTMLButtonElement;
+  private redoBtn!: HTMLButtonElement;
+  private titleInput!: HTMLInputElement;
+  private modeSeg!: HTMLElement;
+  private toastEl: HTMLElement;
+  private tab: Tab = 'tool';
+  private currentMapId: string | null = null;
+  private panelDirty = true;
+  private autosaveTimer = 0;
+  private hintTimer = 0;
+  private lastWorld: unknown = null;
+  private autoCountries = 8;
+  private autoStates = 4;
+  private exportScale = 2;
+  private exportMode: ViewMode = 'physical';
+  private partialMode: 'all' | 'elevation' = 'all';
+  private partialNew = true;
+
+  constructor(private host: UiHost, mount: HTMLElement) {
+    this.root = mount;
+    this.canvas = h('canvas', { 'aria-label': '地図キャンバス' });
+    this.hintEl = h('div', { class: 'hint' });
+    this.busyEl = h('div', { class: 'busy', hidden: true }, h('div', { class: 'busy-card' }, h('div', { class: 'spinner' }), h('span', {})));
+    this.staleEl = h('div', { class: 'stale-banner', hidden: true });
+    const hud = h(
+      'div',
+      { class: 'hud' },
+      h('button', { title: '拡大', html: icon('plus'), onclick: () => host.zoom(1.4) }),
+      h('button', { title: '縮小', html: icon('minus'), onclick: () => host.zoom(1 / 1.4) }),
+      h('button', { title: '全体を表示', html: icon('fit'), onclick: () => host.fit() }),
+    );
+    this.mapWrap = h('div', { class: 'map-wrap' }, this.canvas, this.hintEl, this.staleEl, hud, this.busyEl);
+    this.toolbar = h('nav', { class: 'toolbar', 'aria-label': 'ツール' });
+    this.tabsEl = h('div', { class: 'tabs' });
+    this.panelBody = h('div', { class: 'panel-body' });
+    this.panel = h('aside', { class: 'panel' }, this.tabsEl, this.panelBody);
+    this.toastEl = h('div', { class: 'toast' });
+    mount.append(this.buildTopbar(), this.toolbar, this.mapWrap, this.panel, this.toastEl);
+    this.buildToolbar();
+    this.buildTabs();
+    host.store.subscribe(() => this.onStoreChange());
+    this.panelBody.addEventListener('focusout', () => {
+      if (this.panelDirty) setTimeout(() => this.renderPanel(), 0);
+    });
+    window.addEventListener('keydown', (e) => this.onKey(e));
+    this.onStoreChange();
+  }
+
+  // ---------------------------------------------------------------- 上部バー
+  private buildTopbar(): HTMLElement {
+    const { store } = this.host;
+    this.titleInput = h('input', {
+      class: 'title-input',
+      type: 'text',
+      value: store.world.title,
+      title: '地図のタイトル',
+      onchange: () => actions.setWorldFields(store, { title: this.titleInput.value.trim() || '無題の世界' }),
+    });
+    this.undoBtn = h('button', { class: 'tb-btn', title: '元に戻す (Ctrl+Z)', html: icon('undo'), onclick: () => store.undo() });
+    this.redoBtn = h('button', { class: 'tb-btn', title: 'やり直す (Ctrl+Shift+Z)', html: icon('redo'), onclick: () => store.redo() });
+    this.modeSeg = h('div', { class: 'seg', role: 'group', 'aria-label': '表示モード' });
+    const modes: [ViewMode, string][] = [
+      ['physical', '地形'],
+      ['political', '政治'],
+      ['sketch', '下絵'],
+    ];
+    for (const [m, label] of modes) {
+      this.modeSeg.append(h('button', { 'data-mode': m, onclick: () => this.host.setMode(m) }, label));
+    }
+    const tbBtn = (name: string, label: string, onclick: () => void, title = label) =>
+      h('button', { class: 'tb-btn', title, onclick }, h('span', { html: icon(name) }), h('span', { class: 'tb-label' }, label));
+    return h(
+      'header',
+      { class: 'topbar' },
+      h('div', { class: 'brand' }, '架空地図アトラス', h('small', {}, 'Fantasy Atlas')),
+      this.titleInput,
+      tbBtn('new', '新規', () => this.newDialog()),
+      tbBtn('open', '開く', () => this.openDialog()),
+      tbBtn('save', '保存', () => this.saveToBrowser(false), 'ブラウザに保存'),
+      tbBtn('image', '画像DL', () => this.exportDialog(), '画像としてダウンロード（データ埋め込み）'),
+      this.undoBtn,
+      this.redoBtn,
+      h('div', { class: 'spacer' }),
+      this.modeSeg,
+      h('button', {
+        class: 'tb-btn panel-toggle',
+        title: 'パネル',
+        html: icon('panel'),
+        onclick: () => this.panel.classList.toggle('open'),
+      }),
+    );
+  }
+
+  private buildToolbar(): void {
+    this.toolbar.innerHTML = '';
+    let group = '';
+    for (const t of TOOLS) {
+      if (t.group !== group) {
+        group = t.group;
+        this.toolbar.append(h('div', { class: 'tool-group-label' }, GROUP_LABEL[t.group]));
+      }
+      this.toolbar.append(
+        h(
+          'button',
+          {
+            class: 'tool' + (this.host.getTool() === t.id ? ' on' : ''),
+            'data-tool': t.id,
+            title: t.hint,
+            onclick: () => {
+              this.host.setTool(t.id);
+              this.refreshTools();
+            },
+          },
+          h('span', { html: icon(t.id, 22) }),
+          t.label,
+        ),
+      );
+    }
+  }
+
+  refreshTools(): void {
+    const tool = this.host.getTool();
+    this.toolbar.querySelectorAll<HTMLElement>('.tool').forEach((b) => b.classList.toggle('on', b.dataset.tool === tool));
+    const def = TOOLS.find((t) => t.id === tool);
+    this.hintEl.textContent = def?.hint ?? '';
+    this.hintEl.hidden = !def;
+    clearTimeout(this.hintTimer);
+    this.hintTimer = window.setTimeout(() => (this.hintEl.hidden = true), 6000);
+    if (this.tab === 'tool') this.renderPanel();
+  }
+
+  refreshMode(): void {
+    const mode = this.host.getMode();
+    this.modeSeg.querySelectorAll<HTMLElement>('button').forEach((b) => b.classList.toggle('on', b.dataset.mode === mode));
+  }
+
+  private buildTabs(): void {
+    const tabs: [Tab, string][] = [
+      ['tool', 'ツール'],
+      ['generate', '生成'],
+      ['data', 'データ'],
+      ['features', '地物'],
+    ];
+    this.tabsEl.innerHTML = '';
+    for (const [t, label] of tabs) {
+      this.tabsEl.append(h('button', { 'data-tab': t, class: this.tab === t ? 'on' : '', onclick: () => this.showTab(t) }, label));
+    }
+    this.tabsEl.append(
+      h('button', { class: 'panel-close', title: '閉じる', html: icon('close', 18), onclick: () => this.panel.classList.remove('open') }),
+    );
+  }
+
+  showTab(t: Tab, openPanel = false): void {
+    this.tab = t;
+    this.tabsEl.querySelectorAll<HTMLElement>('button[data-tab]').forEach((b) => b.classList.toggle('on', b.dataset.tab === t));
+    if (openPanel) this.panel.classList.add('open');
+    this.renderPanel();
+  }
+
+  // ---------------------------------------------------------------- 更新
+  private onStoreChange(): void {
+    const { store } = this.host;
+    this.undoBtn.disabled = !store.canUndo;
+    this.redoBtn.disabled = !store.canRedo;
+    if (document.activeElement !== this.titleInput) this.titleInput.value = store.world.title;
+    const busy = store.busy;
+    this.busyEl.hidden = !busy;
+    (this.busyEl.querySelector('span') as HTMLElement).textContent = busy ?? '';
+    this.updateStaleBanner();
+    this.panelDirty = true;
+    const active = document.activeElement;
+    if (!(active && this.panelBody.contains(active) && (active.tagName === 'INPUT' || active.tagName === 'SELECT' || active.tagName === 'TEXTAREA'))) {
+      this.renderPanel();
+    }
+    this.host.requestDraw();
+    if (store.world !== this.lastWorld) {
+      this.lastWorld = store.world;
+      this.scheduleAutosave();
+    }
+  }
+
+  private updateStaleBanner(): void {
+    const { store } = this.host;
+    const w = store.world;
+    this.staleEl.innerHTML = '';
+    if (store.busy) {
+      this.staleEl.hidden = true;
+      return;
+    }
+    if (!w.terrain) {
+      let any = false;
+      for (let i = 0; i < w.paint.length; i += 7) if (w.paint[i] === 1) { any = true; break; }
+      if (any) {
+        this.staleEl.append(
+          h('span', {}, '下絵ができたら地形を生成しましょう'),
+          h('button', { onclick: () => this.generateTerrain() }, '地形を生成'),
+        );
+        this.staleEl.hidden = false;
+        return;
+      }
+    } else if (w.terrainStale) {
+      this.staleEl.append(
+        h('span', {}, '下絵が変更されています'),
+        h('button', { onclick: () => this.generateTerrain() }, '全体を再生成'),
+        h('button', { onclick: () => { this.host.setTool('lasso'); this.refreshTools(); this.showTab('generate', true); } }, '一部だけ'),
+      );
+      this.staleEl.hidden = false;
+      return;
+    }
+    this.staleEl.hidden = true;
+  }
+
+  private renderPanel(): void {
+    this.panelDirty = false;
+    const scrollTop = this.panelBody.scrollTop;
+    this.panelBody.innerHTML = '';
+    switch (this.tab) {
+      case 'tool':
+        this.panelBody.append(...this.renderToolTab());
+        break;
+      case 'generate':
+        this.panelBody.append(...this.renderGenerateTab());
+        break;
+      case 'data':
+        this.panelBody.append(...this.renderDataTab());
+        break;
+      case 'features':
+        this.panelBody.append(...this.renderFeaturesTab());
+        break;
+    }
+    this.panelBody.scrollTop = scrollTop;
+  }
+
+  // ---------------------------------------------------------------- ツールタブ
+  private renderToolTab(): HTMLElement[] {
+    const { settings, flags } = this.host;
+    const tool = this.host.getTool();
+    const out: HTMLElement[] = [];
+    const def = TOOLS.find((t) => t.id === tool)!;
+    const opts = h('div', { class: 'section' }, h('h3', {}, def.label, h('small', {}, GROUP_LABEL[def.group])), h('p', { class: 'note' }, def.hint));
+    if (tool === 'outline') {
+      opts.append(sliderRow('線の太さ', settings.pen, 0.5, 4, 0.1, (v) => v.toFixed(1), (v) => (settings.pen = v)));
+    }
+    if (tool === 'land' || tool === 'sea' || tool === 'erase' || tool === 'ridge-erase' || tool === 'border-erase') {
+      opts.append(sliderRow('ブラシの大きさ', settings.brush, 1, 40, 0.5, (v) => v.toFixed(1), (v) => (settings.brush = v)));
+    }
+    if (tool === 'fill') {
+      const sel = h('div', { class: 'btn-row' });
+      for (const [v, label] of [['land', '陸で塗る'], ['sea', '海で塗る']] as const) {
+        sel.append(h('button', { class: 'btn' + (settings.fillTarget === v ? ' primary' : ''), onclick: () => { settings.fillTarget = v; this.renderPanel(); } }, label));
+      }
+      opts.append(sel, sliderRow('隙間閉じ', settings.gap, 0, 6, 1, (v) => `${v} セル`, (v) => (settings.gap = v)));
+      opts.append(h('p', { class: 'note' }, '輪郭線が少し途切れていても、隙間閉じの幅までは塞いでから塗ります。'));
+    }
+    if (tool === 'national' || tool === 'state') {
+      opts.append(
+        h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: settings.snap, onchange: (e: Event) => (settings.snap = (e.target as HTMLInputElement).checked) }), '端点を海岸・他の境界線へ自動でつなぐ'),
+        h('p', { class: 'note' }, '国境で囲まれた陸地が自動で「国」に、州境で区切られた範囲が「州」になります。名前は自動で付き、データタブで変更できます。'),
+      );
+    }
+    if (tool === 'lasso') {
+      opts.append(h('p', { class: 'note' }, '囲んだあと「生成」タブの「選択範囲を再生成」を押します。'));
+      if (this.host.store.selection) opts.append(h('div', { class: 'btn-row' }, h('button', { class: 'btn primary', onclick: () => this.showTab('generate') }, '再生成の設定へ'), h('button', { class: 'btn', onclick: () => this.host.store.setSelectionPolygon(null) }, '選択解除')));
+    }
+    if (tool === 'ridge' && !this.host.store.world.terrain) {
+      opts.append(h('p', { class: 'note' }, '地形を生成すると、描いた線に沿って山脈ができます。'));
+    }
+    out.push(opts);
+
+    const layer = (key: keyof LayerFlags, label: string) =>
+      h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: flags[key], onchange: (e: Event) => { flags[key] = (e.target as HTMLInputElement).checked; this.host.requestDraw(); } }), label);
+    out.push(
+      h(
+        'div',
+        { class: 'section' },
+        h('h3', {}, '表示'),
+        h('div', { class: 'grid2' },
+          layer('relief', '陰影（起伏）'),
+          layer('rivers', '河川'),
+          layer('contours', '等高線'),
+          layer('borders', '国境・州境'),
+          layer('labels', '地名ラベル'),
+          layer('features', '地物名'),
+          layer('stateFill', '州ごとに塗る'),
+          layer('grid', '方眼'),
+          layer('sketch', '下絵を重ねる'),
+        ),
+      ),
+    );
+    out.push(this.guideSection());
+    return out;
+  }
+
+  private guideSection(): HTMLElement {
+    return h(
+      'div',
+      { class: 'section guide' },
+      h('h3', {}, '使い方'),
+      h(
+        'ol',
+        {},
+        h('li', {}, '「輪郭ペン」で陸地の形を描き、「塗りつぶし」で内側を陸にする（陸ブラシで直接塗っても OK）'),
+        h('li', {}, '「地形を生成」で海岸線が複雑になり、山地・河川・平野ができる'),
+        h('li', {}, '「国境ペン」「州境ペン」で境界を描く、または「生成」タブで架空の国を自動生成'),
+        h('li', {}, '気に入らない所は「範囲選択」で囲んで部分再生成'),
+        h('li', {}, '「画像DL」で PNG として保存。その PNG を「開く」で読み込むと編集を続けられます'),
+      ),
+      h('p', { class: 'note' }, '操作：2 本指／ホイールで拡大縮小、移動ツール・右ドラッグ・スペース＋ドラッグで移動、', h('span', { class: 'kbd' }, 'Ctrl+Z'), ' で元に戻す。'),
+    );
+  }
+
+  // ---------------------------------------------------------------- 生成タブ
+  private renderGenerateTab(): HTMLElement[] {
+    const { store } = this.host;
+    const w = store.world;
+    const p = w.params;
+    const out: HTMLElement[] = [];
+
+    const seedInput = h('input', { type: 'number', value: String(w.seed), onchange: () => actions.setWorldFields(store, { seed: Math.abs(Math.floor(Number(seedInput.value))) || 1 }) });
+    const terrain = h(
+      'div',
+      { class: 'section' },
+      h('h3', {}, '地形の生成', h('small', {}, w.terrain ? (w.terrainStale ? '下絵が変更されています' : '生成済み') : '未生成')),
+      h('div', { class: 'row' }, h('label', {}, 'シード'), seedInput, h('button', { class: 'btn small', title: 'ランダム', html: icon('dice', 16), onclick: () => actions.setWorldFields(store, { seed: randomSeed() }) })),
+      sliderRow('海岸線の複雑さ', p.roughness, 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`, (v) => actions.setParams(store, { roughness: v })),
+      sliderRow('山地の多さ', p.mountains, 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`, (v) => actions.setParams(store, { mountains: v })),
+      sliderRow('最高標高の目安', p.maxElevation, 800, 8000, 100, (v) => `${v}m`, (v) => actions.setParams(store, { maxElevation: v })),
+      sliderRow('侵食（谷の深さ）', p.erosion, 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`, (v) => actions.setParams(store, { erosion: v })),
+      sliderRow('河川の密度', p.riverDensity, 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`, (v) => actions.setParams(store, { riverDensity: v })),
+      h('button', { class: 'btn primary block', onclick: () => this.generateTerrain() }, w.terrain ? '地形を全体再生成' : '地形を生成'),
+      h('p', { class: 'note' }, '河川の密度以外の設定は、次の生成から反映されます。同じシード・同じ下絵なら同じ地形になります。'),
+    );
+    if (w.terrain) {
+      terrain.append(h('div', { class: 'btn-row' }, h('button', { class: 'btn small', onclick: () => actions.terrainToSketch(store) }, '生成結果の海岸線を下絵に取り込む')));
+    }
+    out.push(terrain);
+
+    const sel = store.selection;
+    const partial = h('div', { class: 'section' }, h('h3', {}, '部分再生成', h('small', {}, sel ? '範囲選択中' : '')));
+    if (!w.terrain) partial.append(h('p', { class: 'note' }, '地形を生成すると使えます。'));
+    else {
+      partial.append(
+        h('p', { class: 'note' }, '「範囲選択」ツールで囲んだ範囲だけを作り直し、周囲と滑らかにつなぎます。下絵を描き直した所の反映にも使えます。'),
+        h('label', { class: 'check' }, h('input', { type: 'radio', name: 'pmode', checked: this.partialMode === 'all', onchange: () => (this.partialMode = 'all') }), '海岸線と地形'),
+        h('label', { class: 'check' }, h('input', { type: 'radio', name: 'pmode', checked: this.partialMode === 'elevation', onchange: () => (this.partialMode = 'elevation') }), '地形のみ（海岸線はそのまま）'),
+        h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: this.partialNew, onchange: (e: Event) => (this.partialNew = (e.target as HTMLInputElement).checked) }), '別のパターンにする（シードを変える）'),
+        h('div', { class: 'btn-row' },
+          h('button', { class: 'btn primary', disabled: !sel, onclick: () => this.run(() => actions.regenerateSelection(store, this.partialMode, this.partialNew)) }, '選択範囲を再生成'),
+          sel ? h('button', { class: 'btn', onclick: () => store.setSelectionPolygon(null) }, '選択解除') : h('button', { class: 'btn', onclick: () => { this.host.setTool('lasso'); this.refreshTools(); } }, '範囲を選ぶ'),
+        ),
+      );
+    }
+    out.push(partial);
+
+    const pol = store.political;
+    const liveCountries = pol ? pol.stats.countries.filter((s) => s.cells > 0).length : 0;
+    out.push(
+      h(
+        'div',
+        { class: 'section' },
+        h('h3', {}, '架空の国の自動生成'),
+        sliderRow('国の数', this.autoCountries, 1, 30, 1, (v) => `${v}`, (v) => (this.autoCountries = v)),
+        sliderRow('1国あたりの州', this.autoStates, 1, 12, 1, (v) => `${v}`, (v) => (this.autoStates = v)),
+        h('button', {
+          class: 'btn primary block',
+          onclick: () => {
+            if (w.borders.length > 0 && !confirm('今ある国境・州境と国名はすべて置き換えられます。よろしいですか？（元に戻すこともできます）')) return;
+            this.run(async () => {
+              await actions.autoPolitical(store, this.autoCountries, this.autoStates);
+              this.host.setMode('political');
+            });
+          },
+        }, '国と州を自動生成'),
+        h('p', { class: 'note' }, '山脈・大河・急斜面を越えにくいように領域を広げるので、地形に沿った国境になります。' + (w.terrain ? '' : '（地形を生成してからの方が自然になります）')),
+        h('div', { class: 'btn-row' },
+          h('button', { class: 'btn small', disabled: liveCountries === 0, onclick: () => actions.renameAll(store) }, '国名・州名をすべて作り直す'),
+          h('button', { class: 'btn small danger', disabled: w.borders.length === 0 && w.countries.length === 0, onclick: () => confirm('国境・州境と国のデータを消去しますか？') && actions.clearPolitical(store) }, '政治データを消去'),
+        ),
+      ),
+    );
+
+    const kmInput = h('input', { type: 'number', min: '0.1', step: '0.1', value: String(w.kmPerCell), onchange: () => {
+      const v = Number(kmInput.value);
+      if (v > 0) actions.setWorldFields(store, { kmPerCell: v });
+    } });
+    const titleInput = h('input', { type: 'text', value: w.title, onchange: () => actions.setWorldFields(store, { title: titleInput.value.trim() || '無題の世界' }) });
+    out.push(
+      h(
+        'div',
+        { class: 'section' },
+        h('h3', {}, '地図の設定'),
+        h('div', { class: 'row' }, h('label', {}, 'タイトル'), titleInput),
+        h('div', { class: 'row' }, h('label', {}, '縮尺 (km/セル)'), kmInput),
+        h('p', { class: 'note' }, `グリッド ${w.width}×${w.height} セル ＝ ${fmtKm(w.width * w.kmPerCell)} × ${fmtKm(w.height * w.kmPerCell)}`),
+      ),
+    );
+    return out;
+  }
+
+  // ---------------------------------------------------------------- データタブ
+  private renderDataTab(): HTMLElement[] {
+    const { store } = this.host;
+    const pol = store.political;
+    const out: HTMLElement[] = [];
+    const w = store.world;
+    if (!pol) return [h('p', { class: 'note' }, 'データがありません。')];
+    const { labels, stats } = pol;
+    if (store.selected) out.push(this.inspector());
+
+    let landCells = 0;
+    for (let i = 0; i < store.land.length; i++) landCells += store.land[i];
+    const live = stats.countries.filter((s) => s.cells > 0);
+    const liveStates = stats.states.filter((s) => s.cells > 0);
+    const lf = store.analysis?.landforms;
+    const topPeak = lf?.features.filter((f) => f.kind === 'peak').sort((a, b) => b.elevation - a.elevation)[0];
+    const longest = lf?.features.filter((f) => f.kind === 'river').sort((a, b) => b.length - a.length)[0];
+    out.push(
+      h(
+        'div',
+        { class: 'section' },
+        h('h3', {}, '概要'),
+        h('dl', { class: 'stats' },
+          h('dt', {}, '陸地面積'), h('dd', {}, fmtArea(landCells * w.kmPerCell ** 2)),
+          h('dt', {}, '国の数'), h('dd', {}, String(live.length)),
+          h('dt', {}, '州（行政区画）の数'), h('dd', {}, String(liveStates.length)),
+          topPeak ? [h('dt', {}, '最高峰'), h('dd', {}, `${featureDisplayName(store, topPeak)} ${Math.round(topPeak.elevation).toLocaleString()}m`)] : null,
+          longest ? [h('dt', {}, '最長の川'), h('dd', {}, `${featureDisplayName(store, longest)} ${fmtKm(longest.length * w.kmPerCell)}`)] : null,
+        ),
+      ),
+    );
+
+    const table = h('table', { class: 'list' }, h('thead', {}, h('tr', {}, h('th', {}, '国'), h('th', {}, '面積'), h('th', {}, '州'), h('th', {}, '隣国'))));
+    const tbody = h('tbody', {});
+    const stateCount = new Map<number, number>();
+    for (const s of liveStates) stateCount.set(s.country, (stateCount.get(s.country) ?? 0) + 1);
+    for (const s of [...live].sort((a, b) => b.area - a.area)) {
+      const c = labels.countries[s.index];
+      const selected = store.selected?.kind === 'country' && store.selected.index === s.index;
+      tbody.append(
+        h('tr', { class: 'click' + (selected ? ' sel' : ''), onclick: () => this.selectRegion('country', s.index) },
+          h('td', {}, h('span', { class: 'swatch', style: `background:${c.color}` }), c.name + c.gov),
+          h('td', { class: 'num' }, `${fmtArea(s.area)}`, h('br', {}), h('span', { class: 'muted' }, `${((s.cells / Math.max(1, landCells)) * 100).toFixed(1)}%`)),
+          h('td', { class: 'num' }, String(stateCount.get(s.index) ?? 0)),
+          h('td', {}, [...s.neighbors.keys()].map((k) => labels.countries[k].name).join('、') || h('span', { class: 'muted' }, 'なし')),
+        ),
+      );
+    }
+    table.append(tbody);
+    out.push(h('div', { class: 'section' }, h('h3', {}, '国の一覧', h('small', {}, 'タップで選択')), live.length ? table : h('p', { class: 'note' }, '国境ペンで陸地を区切るか、「生成」タブで自動生成してください。')));
+
+    out.push(
+      h(
+        'div',
+        { class: 'section' },
+        h('h3', {}, 'データの書き出し'),
+        h('p', { class: 'note' }, '行政区画ポリゴン（国・州）を、面積・隣接関係・境界の長さ付きの GeoJSON で書き出します。'),
+        h('div', { class: 'btn-row' },
+          h('button', { class: 'btn', onclick: () => {
+            const json = JSON.stringify(politicalGeoJSON(store), null, 1);
+            downloadBytes(new TextEncoder().encode(json), `${safeFilename(w.title)}.geojson`, 'application/geo+json');
+          } }, 'GeoJSON を書き出す'),
+        ),
+      ),
+    );
+    return out;
+  }
+
+  private inspector(): HTMLElement {
+    const { store } = this.host;
+    const sel = store.selected!;
+    const { labels, stats } = store.political!;
+    if (sel.kind === 'country') {
+      const s = stats.countries[sel.index];
+      const c = labels.countries[sel.index];
+      if (!s || !c) return h('div', {});
+      const culture = cultureByKey(c.culture);
+      const nameIn = h('input', { type: 'text', value: c.name, onchange: () => actions.updateCountry(store, c.id, { name: nameIn.value.trim() || c.name }) });
+      const govIn = h('input', { type: 'text', value: c.gov, onchange: () => actions.updateCountry(store, c.id, { gov: govIn.value.trim() }) });
+      const capIn = h('input', { type: 'text', value: c.capital, onchange: () => actions.updateCountry(store, c.id, { capital: capIn.value.trim() || c.capital }) });
+      const subIn = h('input', { type: 'text', value: c.subdivision, onchange: () => actions.updateCountry(store, c.id, { subdivision: subIn.value.trim() }) });
+      const colorIn = h('input', { type: 'color', value: c.color, onchange: () => actions.updateCountry(store, c.id, { color: colorIn.value }) });
+      const cultureSel = h('select', { onchange: () => actions.updateCountry(store, c.id, { culture: cultureSel.value }) },
+        CULTURES.map((cu) => h('option', { value: cu.key, selected: cu.key === culture.key }, cu.label)));
+      const myStates = stats.states.filter((st) => st.country === sel.index && st.cells > 0).sort((a, b) => b.area - a.area);
+      const stateCountIn = h('input', { type: 'number', min: '1', max: '30', value: String(Math.max(1, myStates.length)), style: 'width:64px;flex:none' });
+      // 選択セルを含む成分（島など）を別の国へ
+      const others = labels.countries.map((cc, k) => ({ cc, k })).filter(({ k }) => k !== sel.index && stats.countries[k]?.cells > 0);
+      const moveSel = h('select', {}, h('option', { value: '' }, '編入先を選ぶ…'), others.map(({ cc }) => h('option', { value: String(cc.id) }, cc.name + cc.gov)));
+      return h(
+        'div',
+        { class: 'card' },
+        h('h4', {}, h('span', { class: 'swatch', style: `background:${c.color}` }), c.name + c.gov, h('span', { class: 'spacer' }), h('button', { class: 'icon-btn', title: '選択解除', html: icon('close', 16), onclick: () => store.select(null) })),
+        h('div', { class: 'row' }, h('label', {}, '国名'), nameIn),
+        h('div', { class: 'row' }, h('label', {}, '政体'), govIn),
+        h('div', { class: 'row' }, h('label', {}, '首都'), capIn),
+        h('div', { class: 'row' }, h('label', {}, '区画の呼び名'), subIn),
+        h('div', { class: 'row' }, h('label', {}, '命名文化'), cultureSel),
+        h('div', { class: 'row' }, h('label', {}, '色'), colorIn),
+        h('dl', { class: 'stats' },
+          h('dt', {}, '面積'), h('dd', {}, fmtArea(s.area)),
+          h('dt', {}, '海岸線'), h('dd', {}, fmtKm(s.coast)),
+          h('dt', {}, '州の数'), h('dd', {}, String(myStates.length)),
+        ),
+        h('div', { class: 'muted', style: 'font-size:12px;margin-bottom:4px' }, '隣国（共有する国境の長さ）'),
+        h('div', { class: 'chips' }, [...s.neighbors].sort((a, b) => b[1] - a[1]).map(([k, len]) => h('span', { class: 'chip', onclick: () => this.selectRegion('country', k) }, `${labels.countries[k].name} ${fmtKm(len)}`))),
+        s.neighbors.size === 0 ? h('div', { class: 'note' }, '陸で接する国はありません') : null,
+        h('div', { class: 'muted', style: 'font-size:12px;margin:8px 0 4px' }, `${c.subdivision || '州'}の一覧`),
+        h('div', { class: 'chips' }, myStates.map((st) => h('span', { class: 'chip', onclick: () => this.selectRegion('state', st.index) }, `${labels.states[st.index].name} ${fmtArea(st.area)}`))),
+        h('div', { class: 'btn-row' },
+          h('button', { class: 'btn small', onclick: () => actions.renameCountryAction(store, c.id) }, '名前を作り直す'),
+        ),
+        h('div', { class: 'row' }, h('label', {}, '州を自動生成'), stateCountIn, h('button', { class: 'btn small', onclick: () => {
+          const k = Math.max(1, Math.min(30, Math.floor(Number(stateCountIn.value)) || 1));
+          actions.regenerateStates(store, sel.index, k);
+        } }, '実行')),
+        others.length ? h('div', { class: 'row' }, h('label', {}, 'タップした島/地域'), moveSel, h('button', { class: 'btn small', onclick: () => {
+          if (!moveSel.value) return;
+          actions.moveComponentTo(store, sel.cell, Number(moveSel.value));
+          store.select(null);
+        } }, '編入')) : null,
+        h('p', { class: 'note' }, `命名文化：${culture.label}。国境で囲まれた範囲（タップした所を含む島や地域）を別の国に編入できます。`),
+      );
+    }
+    const s = stats.states[sel.index];
+    const st = labels.states[sel.index];
+    if (!s || !st) return h('div', {});
+    const country = s.country >= 0 ? labels.countries[s.country] : null;
+    const nameIn = h('input', { type: 'text', value: st.name, onchange: () => actions.updateState(store, st.id, { name: nameIn.value.trim() || st.name }) });
+    const seatIn = h('input', { type: 'text', value: st.seat, onchange: () => actions.updateState(store, st.id, { seat: seatIn.value.trim() || st.seat }) });
+    return h(
+      'div',
+      { class: 'card' },
+      h('h4', {}, st.name + (country?.subdivision ?? ''), h('span', { class: 'spacer' }), h('button', { class: 'icon-btn', title: '選択解除', html: icon('close', 16), onclick: () => store.select(null) })),
+      country ? h('div', { class: 'note' }, '所属：', h('a', { href: '#', onclick: (e: Event) => { e.preventDefault(); this.selectRegion('country', s.country); } }, country.name + country.gov)) : null,
+      h('div', { class: 'row' }, h('label', {}, '名前'), nameIn),
+      h('div', { class: 'row' }, h('label', {}, '中心都市'), seatIn),
+      h('dl', { class: 'stats' },
+        h('dt', {}, '面積'), h('dd', {}, fmtArea(s.area)),
+        h('dt', {}, '国内での割合'), h('dd', {}, country ? `${((s.cells / Math.max(1, stats.countries[s.country].cells)) * 100).toFixed(1)}%` : '-'),
+        h('dt', {}, '海岸線'), h('dd', {}, fmtKm(s.coast)),
+      ),
+      h('div', { class: 'muted', style: 'font-size:12px;margin-bottom:4px' }, '隣接する区画（境界の長さ）'),
+      h('div', { class: 'chips' }, [...s.neighbors].sort((a, b) => b[1] - a[1]).map(([k, len]) => {
+        const other = labels.states[k];
+        const oc = stats.states[k].country;
+        const foreign = oc !== s.country && oc >= 0 ? `（${labels.countries[oc].name}）` : '';
+        return h('span', { class: 'chip', onclick: () => this.selectRegion('state', k) }, `${other.name}${foreign} ${fmtKm(len)}`);
+      })),
+    );
+  }
+
+  selectRegion(kind: 'country' | 'state', index: number, cell?: number): void {
+    const { store } = this.host;
+    const pol = store.political;
+    if (!pol) return;
+    const s = kind === 'country' ? pol.stats.countries[index] : pol.stats.states[index];
+    const anchorCell = cell ?? Math.floor(s.labelY) * store.world.width + Math.floor(s.labelX);
+    store.select({ kind, index, cell: anchorCell });
+    if (this.tab !== 'data') this.showTab('data');
+  }
+
+  // ---------------------------------------------------------------- 地物タブ
+  private renderFeaturesTab(): HTMLElement[] {
+    const { store } = this.host;
+    const w = store.world;
+    if (!w.terrain) return [h('p', { class: 'note' }, '地形を生成すると、山脈・河川・平野などの一覧がここに表示されます。')];
+    const a = store.analysis;
+    if (!a) return [h('p', { class: 'note' }, '解析中…')];
+    const km = w.kmPerCell;
+    const feats = a.landforms.features;
+    const section = (title: string, list: Feature[], cols: [string, (f: Feature) => string][]): HTMLElement | null => {
+      if (list.length === 0) return null;
+      const table = h('table', { class: 'list' }, h('thead', {}, h('tr', {}, h('th', {}, '名前'), cols.map(([c]) => h('th', {}, c)))));
+      const tb = h('tbody', {});
+      for (const f of list) {
+        tb.append(h('tr', { class: 'click', onclick: () => this.host.focusOn(f.x, f.y, Math.max(20, f.extent || f.length / 2 || 20)) },
+          h('td', {}, featureDisplayName(store, f)), cols.map(([, fn]) => h('td', { class: 'num' }, fn(f)))));
+      }
+      table.append(tb);
+      return h('div', { class: 'section' }, h('h3', {}, title, h('small', {}, `${list.length} 件`)), table);
+    };
+    const of = (k: Feature['kind'][]) => feats.filter((f) => k.includes(f.kind));
+    const lfCount = new Map<number, number>();
+    for (let i = 0; i < a.landforms.classes.length; i++) lfCount.set(a.landforms.classes[i], (lfCount.get(a.landforms.classes[i]) ?? 0) + 1);
+    let landCells = 0;
+    for (let i = 0; i < a.land.length; i++) landCells += a.land[i];
+    const pct = (k: number) => `${(((lfCount.get(k) ?? 0) / Math.max(1, landCells)) * 100).toFixed(1)}%`;
+    const sections: (HTMLElement | null)[] = [
+      h('div', { class: 'section' }, h('h3', {}, '地形の構成'), h('dl', { class: 'stats' },
+        h('dt', {}, '平野'), h('dd', {}, pct(2)),
+        h('dt', {}, '丘陵'), h('dd', {}, pct(3)),
+        h('dt', {}, '高原'), h('dd', {}, pct(4)),
+        h('dt', {}, '山地'), h('dd', {}, pct(5)),
+        h('dt', {}, '高山'), h('dd', {}, pct(6)),
+        h('dt', {}, '湖'), h('dd', {}, pct(1)),
+      ), h('p', { class: 'note' }, `区分の目安：平野 < ${Math.round(a.landforms.thresholds.plain)}m、山地 ≥ ${Math.round(a.landforms.thresholds.mountain)}m、高山 ≥ ${Math.round(a.landforms.thresholds.alpine)}m（起伏も考慮）`)),
+      section('山脈・山地', of(['range', 'massif']).sort((x, y) => y.size - x.size), [
+        ['種別', (f) => FEATURE_LABEL[f.kind]],
+        ['最高点', (f) => `${Math.round(f.elevation).toLocaleString()}m`],
+        ['面積', (f) => fmtArea(f.size * km * km)],
+      ]),
+      section('主な山', of(['peak']).sort((x, y) => y.elevation - x.elevation).slice(0, 20), [['標高', (f) => `${Math.round(f.elevation).toLocaleString()}m`]]),
+      section('河川', of(['river']).sort((x, y) => y.length - x.length), [['長さ', (f) => fmtKm(f.length * km)]]),
+      section('平野・盆地・高原', of(['plain', 'basin', 'plateau']).sort((x, y) => y.size - x.size), [
+        ['種別', (f) => FEATURE_LABEL[f.kind]],
+        ['面積', (f) => fmtArea(f.size * km * km)],
+      ]),
+      section('湖', of(['lake']).sort((x, y) => y.size - x.size), [['面積', (f) => fmtArea(f.size * km * km)]]),
+    ];
+    return sections.filter((x): x is HTMLElement => x !== null);
+  }
+
+  // ---------------------------------------------------------------- ダイアログ
+  private dialog(title: string, body: HTMLElement, footer: HTMLElement[] = []): { close: () => void } {
+    const back = h('div', { class: 'dialog-back' });
+    const close = () => back.remove();
+    back.append(
+      h('div', { class: 'dialog', role: 'dialog', 'aria-label': title },
+        h('header', {}, h('h2', {}, title), h('button', { class: 'icon-btn', title: '閉じる', html: icon('close'), onclick: close })),
+        h('div', { class: 'body' }, body),
+        footer.length ? h('footer', {}, footer) : null,
+      ),
+    );
+    back.addEventListener('pointerdown', (e) => { if (e.target === back) close(); });
+    document.body.append(back);
+    return { close };
+  }
+
+  newDialog(): void {
+    const sizes: [string, number, number][] = [
+      ['小 480×320', 480, 320],
+      ['中 720×480', 720, 480],
+      ['大 1080×720', 1080, 720],
+    ];
+    let pick = 1;
+    let template: 'blank' | 'sample' = 'blank';
+    const sizeChoice = h('div', { class: 'choice' }, sizes.map(([label], k) =>
+      h('label', {}, h('input', { type: 'radio', name: 'size', checked: k === pick, onchange: () => (pick = k) }), label)));
+    const tplChoice = h('div', { class: 'choice', style: 'grid-template-columns:1fr 1fr' },
+      h('label', {}, h('input', { type: 'radio', name: 'tpl', checked: true, onchange: () => (template = 'blank') }), '白紙から描く'),
+      h('label', {}, h('input', { type: 'radio', name: 'tpl', onchange: () => (template = 'sample') }), 'サンプルの下絵'),
+    );
+    const d = this.dialog(
+      '新しい地図',
+      h('div', {},
+        h('p', { class: 'note' }, 'グリッドの大きさ（大きいほど精細ですが、生成に時間がかかります）'),
+        sizeChoice,
+        h('p', { class: 'note', style: 'margin-top:12px' }, '始め方'),
+        tplChoice,
+        h('p', { class: 'note warn' }, '今の地図は自動保存されています（「開く」から戻せます）。'),
+      ),
+      [
+        h('button', { class: 'btn', onclick: () => d.close() }, 'キャンセル'),
+        h('button', { class: 'btn primary', onclick: async () => {
+          d.close();
+          await this.saveToBrowser(true);
+          const [, w, hh] = sizes[pick];
+          actions.newWorld(this.host.store, w, hh, template);
+          this.currentMapId = null;
+          this.host.setTool(template === 'blank' ? 'outline' : 'fill');
+          this.refreshTools();
+          this.host.fit();
+        } }, '作成'),
+      ],
+    );
+  }
+
+  async openDialog(): Promise<void> {
+    const list = h('div', { class: 'saved-list' }, h('p', { class: 'note' }, '読み込み中…'));
+    const fileInput = h('input', { type: 'file', accept: 'image/png,.png', style: 'display:none', onchange: async () => {
+      const f = fileInput.files?.[0];
+      if (!f) return;
+      try {
+        const world = await readWorldFromFile(f);
+        d.close();
+        await this.saveToBrowser(true);
+        this.host.store.load(world);
+        this.currentMapId = null;
+        this.host.fit();
+        this.toast(`「${world.title}」を読み込みました`);
+      } catch (e) {
+        this.error(e);
+      }
+    } });
+    const d = this.dialog(
+      '地図を開く',
+      h('div', {},
+        h('div', { class: 'btn-row' }, h('button', { class: 'btn primary', onclick: () => fileInput.click() }, '画像ファイル（PNG）から開く'), fileInput),
+        h('p', { class: 'note' }, 'このアプリの「画像DL」で保存した PNG には地図データが埋め込まれていて、元の状態から編集を続けられます。'),
+        h('h3', { style: 'font-size:13.5px;margin:14px 0 8px' }, 'このブラウザに保存した地図'),
+        list,
+      ),
+    );
+    try {
+      const maps = await listMaps();
+      list.innerHTML = '';
+      if (maps.length === 0) list.append(h('p', { class: 'note' }, 'まだ保存された地図はありません。'));
+      for (const m of maps) {
+        const card = h('div', { class: 'saved', onclick: async () => {
+          try {
+            const rec = await loadMap(m.id);
+            if (!rec) return;
+            if (m.id !== AUTOSAVE_ID) await this.saveToBrowser(true);
+            this.host.store.load(decodeWorld(rec.data));
+            this.currentMapId = m.id === AUTOSAVE_ID ? null : m.id;
+            d.close();
+            this.host.fit();
+            this.toast(`「${m.title}」を開きました`);
+          } catch (e) {
+            this.error(e);
+          }
+        } },
+          h('img', { src: m.thumb, alt: '' }),
+          h('div', { class: 'meta' }, m.id === AUTOSAVE_ID ? `（自動保存）${m.title}` : m.title, h('small', {}, new Date(m.updatedAt).toLocaleString())),
+          h('button', { class: 'icon-btn del', title: '削除', html: icon('close', 14), onclick: async (e: Event) => {
+            e.stopPropagation();
+            if (!confirm(`「${m.title}」を削除しますか？`)) return;
+            await deleteMap(m.id);
+            card.remove();
+          } }),
+        );
+        list.append(card);
+      }
+    } catch (e) {
+      list.innerHTML = '';
+      list.append(h('p', { class: 'note warn' }, 'ブラウザの保存領域を開けませんでした（プライベートモードでは使えないことがあります）。'));
+      console.warn(e);
+    }
+  }
+
+  async saveToBrowser(auto: boolean): Promise<void> {
+    const { store, renderer } = this.host;
+    try {
+      const data = await store.worker.run('encode', store.world);
+      const thumb = thumbnail(store, renderer, store.world.terrain ? 'physical' : 'sketch', this.host.flags);
+      const id = auto ? AUTOSAVE_ID : (this.currentMapId ??= newMapId());
+      await saveMap({ id, title: store.world.title, updatedAt: Date.now(), thumb, data });
+      if (!auto) this.toast('ブラウザに保存しました（「開く」から読み込めます）');
+    } catch (e) {
+      if (!auto) this.error(e);
+      else console.warn('autosave failed', e);
+    }
+  }
+
+  private scheduleAutosave(): void {
+    clearTimeout(this.autosaveTimer);
+    this.autosaveTimer = window.setTimeout(() => {
+      if (this.host.store.busy) return this.scheduleAutosave();
+      this.saveToBrowser(true);
+    }, 2500);
+  }
+
+  exportDialog(): void {
+    const { store } = this.host;
+    const w = store.world;
+    const maxScale = maxExportScale(w);
+    const scales = [1, 2, 3, 4].filter((s) => s <= maxScale);
+    if (!scales.includes(this.exportScale)) this.exportScale = scales[scales.length - 1];
+    this.exportMode = this.host.getMode() === 'sketch' && w.terrain ? 'physical' : this.host.getMode();
+    const info = h('p', { class: 'note' });
+    const updateInfo = () => (info.textContent = `出力サイズ：${Math.round(w.width * this.exportScale)} × ${Math.round(w.height * this.exportScale)} px`);
+    updateInfo();
+    const scaleChoice = h('div', { class: 'choice', style: `grid-template-columns:repeat(${scales.length},1fr)` }, scales.map((s) =>
+      h('label', {}, h('input', { type: 'radio', name: 'scale', checked: s === this.exportScale, onchange: () => { this.exportScale = s; updateInfo(); } }), `${s}倍`)));
+    const modeChoice = h('div', { class: 'choice' }, ([['physical', '地形図'], ['political', '政治図'], ['sketch', '下絵']] as [ViewMode, string][]).map(([m, label]) =>
+      h('label', {}, h('input', { type: 'radio', name: 'emode', checked: m === this.exportMode, onchange: () => (this.exportMode = m) }), label)));
+    const d = this.dialog(
+      '画像としてダウンロード',
+      h('div', {},
+        h('p', { class: 'note' }, '地図を PNG 画像で保存します。画像の中に地図データ（下絵・地形・国境・名前など）が埋め込まれるので、「開く」でこの画像を選ぶと再編集できます。'),
+        h('p', { class: 'note', style: 'margin-top:10px' }, '図の種類'), modeChoice,
+        h('p', { class: 'note', style: 'margin-top:10px' }, '解像度'), scaleChoice, info,
+        h('p', { class: 'note warn' }, '画像を加工・圧縮（JPEG 変換や SNS への投稿など）するとデータは失われます。保存用には元の PNG を残してください。'),
+      ),
+      [
+        h('button', { class: 'btn', onclick: () => d.close() }, 'キャンセル'),
+        h('button', { class: 'btn primary', onclick: async () => {
+          d.close();
+          try {
+            const bytes = await store.withBusy('画像を作成しています…', async () => {
+              await new Promise((r) => setTimeout(r, 30));
+              return buildMapPng(store, this.host.renderer, this.exportMode, this.host.flags, this.exportScale);
+            });
+            downloadBytes(bytes, `${safeFilename(w.title)}.png`, 'image/png');
+            this.toast(`画像を保存しました（${(bytes.length / 1024 / 1024).toFixed(1)} MB）`);
+          } catch (e) {
+            this.error(e);
+          }
+        } }, 'ダウンロード'),
+      ],
+    );
+  }
+
+  // ---------------------------------------------------------------- その他
+  generateTerrain(): Promise<void> {
+    return this.run(async () => {
+      await actions.generateAll(this.host.store);
+      if (this.host.getMode() === 'sketch') this.host.setMode('physical');
+    });
+  }
+
+  async run(fn: () => Promise<void>): Promise<void> {
+    try {
+      await fn();
+    } catch (e) {
+      this.error(e);
+    }
+  }
+
+  toast(msg: string, error = false): void {
+    this.toastEl.textContent = msg;
+    this.toastEl.classList.toggle('error', error);
+    this.toastEl.classList.add('show');
+    clearTimeout((this.toastEl as unknown as { _t: number })._t);
+    (this.toastEl as unknown as { _t: number })._t = window.setTimeout(() => this.toastEl.classList.remove('show'), error ? 5000 : 2600);
+  }
+
+  error(e: unknown): void {
+    console.error(e);
+    this.toast(e instanceof Error ? e.message : String(e), true);
+  }
+
+  private onKey(e: KeyboardEvent): void {
+    const el = document.activeElement;
+    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT')) return;
+    const mod = e.ctrlKey || e.metaKey;
+    if (mod && e.key.toLowerCase() === 'z') {
+      e.preventDefault();
+      if (e.shiftKey) this.host.store.redo();
+      else this.host.store.undo();
+    } else if (mod && e.key.toLowerCase() === 'y') {
+      e.preventDefault();
+      this.host.store.redo();
+    } else if (mod && e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      this.saveToBrowser(false);
+    } else if (e.key === 'Escape') {
+      this.host.store.setSelectionPolygon(null);
+      this.host.store.select(null);
+    }
+  }
+}

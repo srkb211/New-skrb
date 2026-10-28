@@ -1,3 +1,4 @@
+import { fingerprint, sanitizeClimateParams } from '../core/climate';
 import type { TerrainAnalysis } from '../core/generate';
 import { computeStats, derivePolitical, type PoliticalLabels, type PoliticalStats } from '../core/political';
 import { fillPolygon, type Pt } from '../core/raster';
@@ -223,9 +224,35 @@ export class Store {
     this.emit();
   }
 
+  private fpCache: { src: unknown; fp: string } | null = null;
+
+  /** 気候データが今の地形・設定から計算されたものかどうか */
+  climateStatus(): { state: 'none' | 'ok' | 'stale'; reasons: string[] } {
+    const w = this.world;
+    const c = w.climate;
+    if (!c) return { state: 'none', reasons: [] };
+    const reasons: string[] = [];
+    const src = w.terrain?.elevation ?? this.land;
+    if (!this.fpCache || this.fpCache.src !== src) this.fpCache = { src, fp: fingerprint(w.terrain?.elevation ?? this.land) };
+    if (this.fpCache.fp !== c.meta.sourceHash) reasons.push('地形が変わりました');
+    if (stable(sanitizeClimateParams(w.climateParams).params) !== stable(c.meta.params)) reasons.push('気候パラメータが変わりました');
+    if (stable(w.geoFrame) !== stable(c.meta.frame)) reasons.push('世界設定（緯度相当）が変わりました');
+    if (Math.abs(c.meta.cellKm - w.kmPerCell * c.meta.gridFactor) > 1e-6) reasons.push('縮尺が変わりました');
+    if (c.meta.width !== Math.ceil(w.width / c.meta.gridFactor) || c.meta.height !== Math.ceil(w.height / c.meta.gridFactor)) reasons.push('グリッドの大きさが合いません');
+    return { state: reasons.length ? 'stale' : 'ok', reasons };
+  }
+
   nextIds(count: number): number[] {
     const ids: number[] = [];
     for (let k = 0; k < count; k++) ids.push(this.world.nextId + k);
     return ids;
   }
+}
+
+/** キーの順序に依存しない JSON 文字列（設定の比較用） */
+function stable(v: unknown): string {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(stable).join(',')}]`;
+  const o = v as Record<string, unknown>;
+  return `{${Object.keys(o).sort().map((k) => `${JSON.stringify(k)}:${stable(o[k])}`).join(',')}}`;
 }

@@ -13,6 +13,8 @@ const P: Record<string, string> = {
   state: '<path d="M3 18c4-1 4-8 9-9s5-5 9-6" stroke-dasharray="3 3"/>',
   'border-erase': '<path d="M3 18c4-1 4-8 9-9" stroke-dasharray="4 2"/><path d="M15 12l6 6M21 12l-6 6"/>',
   select: '<path d="M5 3l12 6-5 2-2 5z"/><path d="M12 11l6 6"/>',
+  inspect: '<circle cx="12" cy="10" r="3"/><path d="M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11z"/>',
+  climate: '<path d="M7 18a4 4 0 0 1 0-8 5 5 0 0 1 9.6-1.5A3.5 3.5 0 1 1 17 18z"/>',
   undo: '<path d="M9 7L4 12l5 5"/><path d="M4 12h10a6 6 0 0 1 0 12h-2" transform="translate(0 -5)"/>',
   redo: '<path d="M15 7l5 5-5 5"/><path d="M20 12H10a6 6 0 0 0 0 12h2" transform="translate(0 -5)"/>',
   new: '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4M12 11v6M9 14h6"/>',

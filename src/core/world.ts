@@ -1,3 +1,6 @@
+import { withClimateDefaults, type ClimateData, type ClimateParams } from './climate';
+import { DEFAULT_GEO_FRAME, type GeoFrame } from './geoframe';
+import type { FeatureKind } from './names';
 import type { Pt } from './raster';
 
 /** 下絵ペイントの値 */
@@ -62,11 +65,33 @@ export interface StateRecord {
   anchors: Pt[];
 }
 
+/** 生成データに記録する生成方式とバージョン */
+export interface GeneratorMeta {
+  algorithm: string;
+  version: string;
+  seed: number;
+  generatedAt: string;
+  /** 部分再生成などで手を加えた回数 */
+  edits: number;
+}
+
+export const TERRAIN_ALGORITHM = 'fantasy-atlas/terrain-fbm-streampower';
+export const TERRAIN_VERSION = '1.0.0';
+
 export interface TerrainLayers {
   /** 海岸線の連続場（正が陸） */
   coast: Float32Array;
   /** 標高 (m)。海は負の水深 */
   elevation: Float32Array;
+  meta?: GeneratorMeta;
+}
+
+/** 地物（山脈・川など）の名前の手動上書き。代表点の近くの同種の地物に適用する */
+export interface FeatureNameOverride {
+  kind: FeatureKind;
+  x: number;
+  y: number;
+  name: string;
 }
 
 export interface WorldState {
@@ -88,6 +113,14 @@ export interface WorldState {
   countries: CountryRecord[];
   states: StateRecord[];
   nextId: number;
+  /** 地物名の手動上書き */
+  featureNames: FeatureNameOverride[];
+  /** 世界設定：地図座標と気候計算用の緯度相当座標の対応 */
+  geoFrame: GeoFrame;
+  /** 気候の計算パラメータと分類条件 */
+  climateParams: ClimateParams;
+  /** 計算済みの気候（地形と同じく履歴・保存の対象） */
+  climate: ClimateData | null;
 }
 
 export function createWorld(width: number, height: number, seed: number): WorldState {
@@ -106,6 +139,10 @@ export function createWorld(width: number, height: number, seed: number): WorldS
     countries: [],
     states: [],
     nextId: 1,
+    featureNames: [],
+    geoFrame: { ...DEFAULT_GEO_FRAME },
+    climateParams: withClimateDefaults({ seed }),
+    climate: null,
   };
 }
 

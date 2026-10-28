@@ -4,6 +4,7 @@ import { LF_LAKE } from '../core/landforms';
 import type { Pt } from '../core/raster';
 import { chaikin, simplify, type Ring } from '../core/topology';
 import { PAINT_LAND, PAINT_OUTLINE } from '../core/world';
+import { climateColor, type ClimateLayer } from './climate-style';
 import { COLORS, landColor, seaColor } from './palette';
 import type { Store } from './store';
 
@@ -114,6 +115,51 @@ export class MapLayers {
       }
     }
     ctx.putImageData(img, x0, y0);
+  }
+
+  /** 気候レイヤーのラスタ（気候グリッドの解像度） */
+  climateCanvas(layer: ClimateLayer): HTMLCanvasElement | null {
+    const c = this.store.world.climate;
+    if (!c || layer === 'none') return null;
+    return this.cached('climate-' + layer, [c], () => {
+      const cw = c.meta.width;
+      const ch = c.meta.height;
+      const canvas = makeCanvas(cw, ch);
+      const ctx = canvas.getContext('2d')!;
+      const img = ctx.createImageData(cw, ch);
+      const d = img.data;
+      for (let i = 0; i < cw * ch; i++) {
+        const col = climateColor(layer, c, i);
+        if (!col) continue;
+        d[i * 4] = col[0];
+        d[i * 4 + 1] = col[1];
+        d[i * 4 + 2] = col[2];
+        d[i * 4 + 3] = 255;
+      }
+      ctx.putImageData(img, 0, 0);
+      return canvas;
+    });
+  }
+
+  /** 陰影だけの灰色ラスタ（乗算で重ねて起伏を残す） */
+  reliefCanvas(): HTMLCanvasElement | null {
+    const { world } = this.store;
+    const sh = this.hillshade();
+    if (!sh) return null;
+    return this.cached('relief', [sh], () => {
+      const c = makeCanvas(world.width, world.height);
+      const ctx = c.getContext('2d')!;
+      const img = ctx.createImageData(world.width, world.height);
+      for (let i = 0; i < sh.length; i++) {
+        const v = 255 * Math.max(0.5, Math.min(1, 0.12 + sh[i] * 0.88));
+        img.data[i * 4] = v;
+        img.data[i * 4 + 1] = v;
+        img.data[i * 4 + 2] = v;
+        img.data[i * 4 + 3] = 255;
+      }
+      ctx.putImageData(img, 0, 0);
+      return c;
+    });
   }
 
   /** 陰影（ヒルシェード）係数。1 が平坦。 */

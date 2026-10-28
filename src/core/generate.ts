@@ -4,7 +4,7 @@ import { analyzeHydrology, type Hydrology } from './hydrology';
 import { classifyLandforms, type Landforms } from './landforms';
 import { smoothstep } from './noise';
 import { blendField, fillMinorDepressions, generateElevation } from './terrain';
-import { landFromCoast, landFromPaint, type GenParams, type Stroke, type TerrainLayers } from './world';
+import { landFromCoast, landFromPaint, TERRAIN_ALGORITHM, TERRAIN_VERSION, type GenParams, type Stroke, type TerrainLayers } from './world';
 
 export interface TerrainJob {
   paint: Uint8Array;
@@ -32,7 +32,11 @@ export function generateTerrain(job: TerrainJob): TerrainLayers {
   const land = landFromCoast(coast);
   const elevation = generateElevation(land, w, h, seed, params, ridges);
   quantizeElevation(elevation);
-  return { coast, elevation };
+  return {
+    coast,
+    elevation,
+    meta: { algorithm: TERRAIN_ALGORITHM, version: TERRAIN_VERSION, seed, generatedAt: new Date().toISOString(), edits: 0 },
+  };
 }
 
 /**
@@ -73,7 +77,12 @@ export function regeneratePartial(job: PartialJob): TerrainLayers {
   }
   fillMinorDepressions(elevation, land, w, h, params.riverDensity);
   quantizeElevation(elevation);
-  return { coast, elevation };
+  const base = old.meta ?? { algorithm: TERRAIN_ALGORITHM, version: TERRAIN_VERSION, seed: job.seed, generatedAt: '', edits: 0 };
+  return {
+    coast,
+    elevation,
+    meta: { ...base, version: TERRAIN_VERSION, generatedAt: new Date().toISOString(), edits: base.edits + 1 },
+  };
 }
 
 export interface TerrainAnalysis {

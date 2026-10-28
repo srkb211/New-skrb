@@ -1,10 +1,13 @@
 import { mapScale } from '../core/coast';
+import type { ClimateData, ClimateParams } from '../core/climate';
+import type { GeoFrame } from '../core/geoframe';
+import type { FeatureKind } from '../core/names';
 import { regenerateCountryStates, reassignComponent, renameCountry } from '../core/edits';
 import { stampPolyline, type Pt } from '../core/raster';
 import { randomSeed } from '../core/rng';
 import { sampleSketch } from '../core/sample';
 import { cleanStroke, fillPaint, snapBorderStroke } from '../core/strokes';
-import { createWorld, landFromCoast, PAINT_LAND, PAINT_SEA, type BorderKind, type CountryRecord, type GenParams, type StateRecord, type Stroke, type WorldState } from '../core/world';
+import { createWorld, landFromCoast, landFromPaint, PAINT_LAND, PAINT_SEA, type BorderKind, type CountryRecord, type GenParams, type StateRecord, type Stroke, type TerrainLayers, type WorldState } from '../core/world';
 import type { Store } from './store';
 
 export function newWorld(store: Store, w: number, h: number, template: 'blank' | 'sample'): void {
@@ -35,17 +38,54 @@ export async function generateAll(store: Store): Promise<void> {
   let any = false;
   for (let i = 0; i < world.paint.length; i++) if (world.paint[i]) { any = true; break; }
   if (!any) throw new Error('下絵に陸地がありません。輪郭を描いて陸を塗ってください。');
-  const terrain = await store.withBusy('地形を生成しています…', () =>
-    store.worker.run('generate', {
+  const { terrain, climate } = await store.withBusy('地形と気候を生成しています…', async () => {
+    const terrain = await store.worker.run('generate', {
       paint: world.paint,
       w: world.width,
       h: world.height,
       seed: world.seed,
       params: world.params,
       ridges: world.ridges,
-    }),
-  );
-  store.commit({ ...store.world, terrain, terrainStale: false });
+    });
+    return { terrain, climate: await climateFor(store, world, terrain) };
+  });
+  store.commit({ ...store.world, terrain, climate, terrainStale: false });
+}
+
+/** 地形（または下絵）から気候を計算する */
+function climateFor(store: Store, world: WorldState, terrain: TerrainLayers | null): Promise<ClimateData> {
+  const land = terrain ? landFromCoast(terrain.coast) : landFromPaint(world.paint, world.width, world.height);
+  return store.worker.run('climate', {
+    w: world.width,
+    h: world.height,
+    kmPerCell: world.kmPerCell,
+    land,
+    elevation: terrain?.elevation ?? null,
+    frame: world.geoFrame,
+    params: world.climateParams,
+  });
+}
+
+/** 現在の設定で気候を（再）計算する */
+export async function computeClimateAction(store: Store): Promise<void> {
+  const { world } = store;
+  let any = false;
+  for (let i = 0; i < store.land.length; i++) if (store.land[i]) { any = true; break; }
+  if (!any) throw new Error('陸地がありません。下絵を描くか地形を生成してください。');
+  const climate = await store.withBusy('気候を計算しています…', () => climateFor(store, world, world.terrain));
+  store.commit({ ...store.world, climate });
+}
+
+export function setGeoFrame(store: Store, patch: Partial<GeoFrame>): void {
+  store.commit({ ...store.world, geoFrame: { ...store.world.geoFrame, ...patch } });
+}
+
+export function setClimateParams(store: Store, patch: Partial<ClimateParams>): void {
+  const p = store.world.climateParams;
+  store.commit({
+    ...store.world,
+    climateParams: { ...p, ...patch, koppen: { ...p.koppen, ...(patch.koppen ?? {}) }, biome: { ...p.biome, ...(patch.biome ?? {}) } },
+  });
 }
 
 /** 選択範囲を作り直す */
@@ -53,8 +93,8 @@ export async function regenerateSelection(store: Store, mode: 'all' | 'elevation
   const { world, selection } = store;
   if (!world.terrain) throw new Error('先に地形を生成してください。');
   if (!selection) throw new Error('範囲選択ツールで再生成する範囲を囲んでください。');
-  const terrain = await store.withBusy('選択範囲を再生成しています…', () =>
-    store.worker.run('partial', {
+  const { terrain, climate } = await store.withBusy('選択範囲を再生成しています…', async () => {
+    const terrain = await store.worker.run('partial', {
       paint: world.paint,
       w: world.width,
       h: world.height,
@@ -65,9 +105,10 @@ export async function regenerateSelection(store: Store, mode: 'all' | 'elevation
       selection,
       mode,
       variationSeed: newPattern ? randomSeed() : world.seed,
-    }),
-  );
-  store.commit({ ...store.world, terrain });
+    });
+    return { terrain, climate: await climateFor(store, world, terrain) };
+  });
+  store.commit({ ...store.world, terrain, climate });
 }
 
 /** 山脈ガイドの追加・削除。地形があればその周辺の標高だけ作り直す。 */
@@ -82,8 +123,8 @@ export async function setRidges(store: Store, ridges: Stroke[], touched: Pt[][])
   const selection = new Uint8Array(w * h);
   const r = 26 * mapScale(w, h);
   for (const pts of touched) stampPolyline(pts, r, w, h, (i) => (selection[i] = 1));
-  const terrain = await store.withBusy('山脈を反映しています…', () =>
-    store.worker.run('partial', {
+  const { terrain, climate } = await store.withBusy('山脈を反映しています…', async () => {
+    const terrain = await store.worker.run('partial', {
       paint: world.paint,
       w,
       h,
@@ -94,9 +135,10 @@ export async function setRidges(store: Store, ridges: Stroke[], touched: Pt[][])
       selection,
       mode: 'elevation',
       variationSeed: world.seed,
-    }),
-  );
-  store.commit({ ...store.world, ridges, terrain });
+    });
+    return { terrain, climate: await climateFor(store, world, terrain) };
+  });
+  store.commit({ ...store.world, ridges, terrain, climate });
 }
 
 export function addRidge(store: Store, raw: Pt[]): Promise<void> {
@@ -207,4 +249,41 @@ export function terrainToSketch(store: Store): void {
   if (!world.terrain) return;
   const land = landFromCoast(world.terrain.coast);
   store.commit({ ...world, paint: land, terrainStale: false });
+}
+
+/** 地物の名前を手動で設定する（空文字または自動名と同じなら手動設定を解除） */
+export function renameFeature(store: Store, kind: FeatureKind, keyCell: number, name: string, autoName: string): void {
+  const { world } = store;
+  const x = keyCell % world.width;
+  const y = Math.floor(keyCell / world.width);
+  const rest = world.featureNames.filter((o) => !(o.kind === kind && (o.x - x) ** 2 + (o.y - y) ** 2 <= 4));
+  const trimmed = name.trim();
+  const featureNames = trimmed && trimmed !== autoName ? [...rest, { kind, x, y, name: trimmed }] : rest;
+  store.commit({ ...world, featureNames });
+}
+
+/** 首都の位置を変える（その国の陸地の中に限る） */
+export function setCapitalLocation(store: Store, countryId: number, x: number, y: number): void {
+  const { world, political } = store;
+  const cell = Math.floor(y) * world.width + Math.floor(x);
+  const ci = world.countries.findIndex((c) => c.id === countryId);
+  if (!political || ci < 0 || political.labels.country[cell] !== ci) throw new Error('首都はその国の陸地の中に置いてください');
+  const pt: Pt = [Math.floor(x), Math.floor(y)];
+  const countries = world.countries.map((c) =>
+    c.id === countryId ? { ...c, anchors: [pt, ...c.anchors.filter((a) => a[0] !== pt[0] || a[1] !== pt[1])] } : c,
+  );
+  store.commit({ ...world, countries });
+}
+
+/** 州都（中心都市）の位置を変える（その州の中に限る） */
+export function setSeatLocation(store: Store, stateId: number, x: number, y: number): void {
+  const { world, political } = store;
+  const cell = Math.floor(y) * world.width + Math.floor(x);
+  const si = world.states.findIndex((s) => s.id === stateId);
+  if (!political || si < 0 || political.labels.state[cell] !== si) throw new Error('中心都市はその区画の中に置いてください');
+  const pt: Pt = [Math.floor(x), Math.floor(y)];
+  const states = world.states.map((s) =>
+    s.id === stateId ? { ...s, anchors: [pt, ...s.anchors.filter((a) => a[0] !== pt[0] || a[1] !== pt[1])] } : s,
+  );
+  store.commit({ ...world, states });
 }

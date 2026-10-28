@@ -29,6 +29,7 @@ async function boot(): Promise<void> {
   const flags = { ...DEFAULT_LAYERS };
   const settings = { ...DEFAULT_TOOL_SETTINGS };
   const overlay: Overlay = {};
+  let inspect: { x: number; y: number } | null = null;
   let tool: ToolId = restored ? 'pan' : 'outline';
   let mode: ViewMode = initial.terrain ? 'physical' : 'sketch';
   if (restored && initial.borders.length > 0) mode = 'political';
@@ -49,7 +50,11 @@ async function boot(): Promise<void> {
         tool = t;
         const group = TOOLS.find((d) => d.id === t)?.group;
         if (group === 'political' && mode === 'sketch') setMode('political');
-        if (group === 'terrain' && mode === 'sketch' && store.world.terrain) setMode('physical');
+        if ((group === 'terrain' || group === 'climate') && mode === 'sketch' && (store.world.terrain || store.world.climate)) setMode('physical');
+        if (t === 'inspect') {
+          if (flags.climate === 'none' && store.world.climate) flags.climate = 'biome';
+          ui.showTab('climate', false);
+        }
         requestDraw();
       },
       settings,
@@ -71,6 +76,7 @@ async function boot(): Promise<void> {
         view.oy = r.height / 2 - y * view.scale;
         requestDraw();
       },
+      getInspect: () => inspect,
     },
     document.getElementById('app')!,
   );
@@ -131,7 +137,17 @@ async function boot(): Promise<void> {
       if (paint !== store.world.paint) renderer.layers.sketchCanvas(paint);
     },
     onError: (e) => ui.error(e),
+    pickActive: () => ui.pendingPick !== null,
+    onPick: (x, y) => ui.completePick(x, y),
     onSelectAt: (x, y) => {
+      if (tool === 'inspect') {
+        const inside = x >= 0 && y >= 0 && x < store.world.width && y < store.world.height;
+        inspect = inside ? { x, y } : null;
+        overlay.inspect = inspect ?? undefined;
+        ui.showTab('climate', true);
+        requestDraw();
+        return;
+      }
       const pol = store.political;
       const w = store.world.width;
       const cx = Math.floor(x);

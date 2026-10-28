@@ -11,12 +11,13 @@ export type ToolId =
   | 'national'
   | 'state'
   | 'border-erase'
-  | 'select';
+  | 'select'
+  | 'inspect';
 
 export interface ToolDef {
   id: ToolId;
   label: string;
-  group: 'view' | 'sketch' | 'terrain' | 'political';
+  group: 'view' | 'sketch' | 'terrain' | 'political' | 'climate';
   hint: string;
 }
 
@@ -34,6 +35,7 @@ export const TOOLS: ToolDef[] = [
   { id: 'state', label: '州境ペン', group: 'political', hint: '国の中を区切る州境を描きます' },
   { id: 'border-erase', label: '境界消し', group: 'political', hint: 'なぞった所の国境・州境を消します' },
   { id: 'select', label: '区画選択', group: 'political', hint: '国や州をタップして情報を見たり名前を変えたりします' },
+  { id: 'inspect', label: '地点情報', group: 'climate', hint: 'タップした地点の気温・降水量・気候区分・バイオームを表示します' },
 ];
 
 export const GROUP_LABEL: Record<ToolDef['group'], string> = {
@@ -41,6 +43,7 @@ export const GROUP_LABEL: Record<ToolDef['group'], string> = {
   sketch: '下絵',
   terrain: '地形',
   political: '政治',
+  climate: '気候',
 };
 
 export interface ToolSettings {

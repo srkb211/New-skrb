@@ -1,5 +1,6 @@
 import { autoGeneratePolitical, type AutoPoliticalOptions, type AutoPoliticalResult, type TerrainHints } from '../core/autogen';
 import { analyzeTerrain, generateTerrain, regeneratePartial, type PartialJob, type TerrainAnalysis, type TerrainJob } from '../core/generate';
+import { computeClimate, type ClimateData, type ClimateInput } from '../core/climate';
 import { encodeWorld } from '../core/serialize';
 import type { GenParams, TerrainLayers, WorldState } from '../core/world';
 
@@ -13,6 +14,7 @@ export interface TaskMap {
     output: AutoPoliticalResult;
   };
   encode: { input: WorldState; output: Uint8Array };
+  climate: { input: ClimateInput; output: ClimateData };
 }
 
 export type TaskName = keyof TaskMap;
@@ -23,4 +25,5 @@ export const TASKS: { [K in TaskName]: (input: TaskMap[K]['input']) => TaskMap[K
   analyze: ({ terrain, w, h, params }) => analyzeTerrain(terrain, w, h, params),
   autoPolitical: ({ land, w, h, hints, opts, startId }) => autoGeneratePolitical(land, w, h, hints, opts, startId),
   encode: (world) => encodeWorld(world),
+  climate: (input) => computeClimate(input),
 };

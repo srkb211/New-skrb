@@ -1,3 +1,22 @@
+import {
+  BIOMES,
+  CLIMATE_ASSUMPTIONS,
+  CLIMATE_UNITS,
+  DEFAULT_BIOME,
+  DEFAULT_KOPPEN,
+  KOPPEN_CODES,
+  KOPPEN_INFO,
+  climateCellAt,
+  climateCellInfo,
+  climateCsv,
+  sanitizeClimateParams,
+  validateClimate,
+  type BiomeThresholds,
+  type ClimateCellInfo,
+  type KoppenThresholds,
+  type ValidationIssue,
+} from '../core/climate';
+import { formatLatitude, latitudeRange } from '../core/geoframe';
 import { CULTURES, FEATURE_LABEL, cultureByKey } from '../core/names';
 import { decodeWorld } from '../core/serialize';
 import { randomSeed } from '../core/rng';
@@ -5,8 +24,9 @@ import type { Feature } from '../core/landforms';
 import * as actions from './actions';
 import { fmtArea, fmtKm, h, sliderRow } from './dom';
 import { buildMapPng, downloadBytes, maxExportScale, politicalGeoJSON, readWorldFromFile, safeFilename, thumbnail } from './exporter';
+import { CLIMATE_LAYERS, type ClimateLayer } from './climate-style';
 import { icon } from './icons';
-import { featureDisplayName } from './labels';
+import { featureAutoName, featureDisplayName, featureOverride } from './labels';
 import type { LayerFlags, MapRenderer } from './renderer';
 import { AUTOSAVE_ID, deleteMap, listMaps, loadMap, newMapId, saveMap } from './storage';
 import type { Store, ViewMode } from './store';
@@ -25,9 +45,19 @@ export interface UiHost {
   fit: () => void;
   zoom: (f: number) => void;
   focusOn: (x: number, y: number, radiusCells: number) => void;
+  /** 地点情報ツールで調べている地点（地形セル座標） */
+  getInspect: () => { x: number; y: number } | null;
 }
 
-type Tab = 'tool' | 'generate' | 'data' | 'features';
+type Tab = 'tool' | 'generate' | 'data' | 'features' | 'climate';
+type BoolFlag = { [K in keyof LayerFlags]: LayerFlags[K] extends boolean ? K : never }[keyof LayerFlags];
+
+/** 地図上の地点指定（首都・州都の位置）を待っている状態 */
+export interface PendingPick {
+  kind: 'capital' | 'seat';
+  id: number;
+  label: string;
+}
 
 /** 画面の DOM 部分（上部バー・ツールバー・パネル・ダイアログ） */
 export class AppUI {
@@ -57,6 +87,8 @@ export class AppUI {
   private exportScale = 2;
   private exportMode: ViewMode = 'physical';
   private partialMode: 'all' | 'elevation' = 'all';
+  /** 地点指定の待ち（首都の位置など） */
+  pendingPick: PendingPick | null = null;
   private partialNew = true;
 
   constructor(private host: UiHost, mount: HTMLElement) {
@@ -183,6 +215,7 @@ export class AppUI {
       ['generate', '生成'],
       ['data', 'データ'],
       ['features', '地物'],
+      ['climate', '気候'],
     ];
     this.tabsEl.innerHTML = '';
     for (const [t, label] of tabs) {
@@ -270,6 +303,9 @@ export class AppUI {
       case 'features':
         this.panelBody.append(...this.renderFeaturesTab());
         break;
+      case 'climate':
+        this.panelBody.append(...this.renderClimateTab());
+        break;
     }
     this.panelBody.scrollTop = scrollTop;
   }
@@ -310,7 +346,7 @@ export class AppUI {
     }
     out.push(opts);
 
-    const layer = (key: keyof LayerFlags, label: string) =>
+    const layer = (key: BoolFlag, label: string) =>
       h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: flags[key], onchange: (e: Event) => { flags[key] = (e.target as HTMLInputElement).checked; this.host.requestDraw(); } }), label);
     out.push(
       h(
@@ -327,7 +363,10 @@ export class AppUI {
           layer('stateFill', '州ごとに塗る'),
           layer('grid', '方眼'),
           layer('sketch', '下絵を重ねる'),
+          layer('latitude', '緯度相当線'),
+          layer('wind', '卓越風'),
         ),
+        this.climateLayerSelect(),
       ),
     );
     out.push(this.guideSection());
@@ -435,6 +474,7 @@ export class AppUI {
         h('div', { class: 'row' }, h('label', {}, 'タイトル'), titleInput),
         h('div', { class: 'row' }, h('label', {}, '縮尺 (km/セル)'), kmInput),
         h('p', { class: 'note' }, `グリッド ${w.width}×${w.height} セル ＝ ${fmtKm(w.width * w.kmPerCell)} × ${fmtKm(w.height * w.kmPerCell)}`),
+        h('p', { class: 'note' }, '緯度相当・北相当の向き・地軸の傾きなどの世界設定は「気候」タブにあります（地図の Y 座標は緯度とはみなしません）。'),
       ),
     );
     return out;
@@ -536,6 +576,7 @@ export class AppUI {
         h('div', { class: 'row' }, h('label', {}, '国名'), nameIn),
         h('div', { class: 'row' }, h('label', {}, '政体'), govIn),
         h('div', { class: 'row' }, h('label', {}, '首都'), capIn),
+        h('div', { class: 'row' }, h('label', {}, '首都の位置'), this.pickButton({ kind: 'capital', id: c.id, label: `${c.name}の首都にする地点` })),
         h('div', { class: 'row' }, h('label', {}, '区画の呼び名'), subIn),
         h('div', { class: 'row' }, h('label', {}, '命名文化'), cultureSel),
         h('div', { class: 'row' }, h('label', {}, '色'), colorIn),
@@ -577,6 +618,7 @@ export class AppUI {
       country ? h('div', { class: 'note' }, '所属：', h('a', { href: '#', onclick: (e: Event) => { e.preventDefault(); this.selectRegion('country', s.country); } }, country.name + country.gov)) : null,
       h('div', { class: 'row' }, h('label', {}, '名前'), nameIn),
       h('div', { class: 'row' }, h('label', {}, '中心都市'), seatIn),
+      h('div', { class: 'row' }, h('label', {}, '中心都市の位置'), this.pickButton({ kind: 'seat', id: st.id, label: `${st.name}の中心都市にする地点` })),
       h('dl', { class: 'stats' },
         h('dt', {}, '面積'), h('dd', {}, fmtArea(s.area)),
         h('dt', {}, '国内での割合'), h('dd', {}, country ? `${((s.cells / Math.max(1, stats.countries[s.country].cells)) * 100).toFixed(1)}%` : '-'),
@@ -592,6 +634,47 @@ export class AppUI {
     );
   }
 
+  private pickButton(pick: PendingPick): HTMLElement {
+    const active = this.pendingPick?.kind === pick.kind && this.pendingPick.id === pick.id;
+    return h('button', {
+      class: 'btn small' + (active ? ' primary' : ''),
+      onclick: () => {
+        this.pendingPick = active ? null : pick;
+        this.showPickHint();
+        this.renderPanel();
+      },
+    }, active ? '地図をタップ…（取り消す）' : '地図で指定');
+  }
+
+  private showPickHint(): void {
+    if (this.pendingPick) {
+      clearTimeout(this.hintTimer);
+      this.hintEl.textContent = `${this.pendingPick.label}をタップしてください（Esc で取り消し）`;
+      this.hintEl.hidden = false;
+      this.mapWrap.classList.add('picking');
+      if (window.matchMedia('(max-width: 900px)').matches) this.panel.classList.remove('open');
+    } else {
+      this.hintEl.hidden = true;
+      this.mapWrap.classList.remove('picking');
+    }
+  }
+
+  /** 地図上でタップされた地点で、待っていた指定を実行する */
+  completePick(x: number, y: number): void {
+    const pick = this.pendingPick;
+    if (!pick) return;
+    try {
+      if (pick.kind === 'capital') actions.setCapitalLocation(this.host.store, pick.id, x, y);
+      else actions.setSeatLocation(this.host.store, pick.id, x, y);
+      this.pendingPick = null;
+      this.showPickHint();
+      this.toast(pick.kind === 'capital' ? '首都の位置を変更しました' : '中心都市の位置を変更しました');
+    } catch (e) {
+      this.error(e);
+    }
+    this.renderPanel();
+  }
+
   selectRegion(kind: 'country' | 'state', index: number, cell?: number): void {
     const { store } = this.host;
     const pol = store.political;
@@ -600,6 +683,356 @@ export class AppUI {
     const anchorCell = cell ?? Math.floor(s.labelY) * store.world.width + Math.floor(s.labelX);
     store.select({ kind, index, cell: anchorCell });
     if (this.tab !== 'data') this.showTab('data');
+  }
+
+  // ---------------------------------------------------------------- 気候タブ
+  climateLayerSelect(): HTMLElement {
+    const { flags } = this.host;
+    const sel = h('select', {
+      onchange: () => {
+        flags.climate = sel.value as ClimateLayer;
+        this.host.requestDraw();
+        this.renderPanel();
+      },
+    }, CLIMATE_LAYERS.map((l) => h('option', { value: l.id, selected: flags.climate === l.id }, l.label)));
+    const wrap = h('div', {}, h('div', { class: 'row' }, h('label', {}, '気候レイヤー'), sel));
+    if (flags.climate !== 'none') {
+      wrap.append(sliderRow('不透明度', flags.climateOpacity, 0.2, 1, 0.05, (v) => `${Math.round(v * 100)}%`, (v) => { flags.climateOpacity = v; this.host.requestDraw(); }));
+      if (!this.host.store.world.climate) wrap.append(h('p', { class: 'note warn' }, '気候がまだ計算されていません。「気候」タブで計算してください。'));
+    }
+    return wrap;
+  }
+
+  private numRow(label: string, value: number, unit: string, step: number, onCommit: (v: number) => void, title?: string): HTMLElement {
+    const input: HTMLInputElement = h('input', {
+      type: 'number',
+      step: String(step),
+      value: String(value),
+      title,
+      onchange: () => {
+        const v = Number(input.value);
+        if (input.value.trim() === '' || !Number.isFinite(v)) {
+          this.toast('数値を入力してください', true);
+          input.value = String(value);
+          return;
+        }
+        onCommit(v);
+      },
+    });
+    return h('div', { class: 'row', title }, h('label', {}, label), input, h('span', { class: 'unit' }, unit));
+  }
+
+  private renderClimateTab(): HTMLElement[] {
+    const { store } = this.host;
+    const w = store.world;
+    const c = w.climate;
+    const p = w.climateParams;
+    const status = store.climateStatus();
+    const out: HTMLElement[] = [];
+
+    // 状態
+    const stateLabel = status.state === 'none' ? '未計算' : status.state === 'ok' ? '計算済み' : '要再計算';
+    const st = h('div', { class: 'section' }, h('h3', {}, '気候の計算', h('small', {}, stateLabel)));
+    if (c) {
+      st.append(h('dl', { class: 'stats' },
+        h('dt', {}, '生成方式'), h('dd', {}, c.meta.algorithm.split('/').pop() ?? c.meta.algorithm),
+        h('dt', {}, 'バージョン'), h('dd', {}, c.meta.version),
+        h('dt', {}, 'シード'), h('dd', {}, String(c.meta.seed)),
+        h('dt', {}, '気候グリッド'), h('dd', {}, `${c.meta.width}×${c.meta.height}（1 セル ${c.meta.cellKm} km）`),
+        h('dt', {}, '計算日時'), h('dd', {}, new Date(c.meta.generatedAt).toLocaleString()),
+        w.terrain?.meta ? [h('dt', {}, '地形の生成方式'), h('dd', {}, `${w.terrain.meta.algorithm.split('/').pop()} v${w.terrain.meta.version}${w.terrain.meta.edits ? `（部分修正 ${w.terrain.meta.edits} 回）` : ''}`)] : null,
+      ));
+    }
+    if (status.state === 'stale') st.append(h('p', { class: 'note warn' }, `再計算が必要です：${status.reasons.join('、')}`));
+    st.append(
+      h('button', { class: 'btn primary block', onclick: () => this.run(async () => {
+        await actions.computeClimateAction(store);
+        if (this.host.flags.climate === 'none') this.host.flags.climate = 'biome';
+        this.host.requestDraw();
+      }) }, c ? '気候を再計算' : '気候を計算'),
+      h('p', { class: 'note' }, '地形を生成・部分再生成すると自動で計算し直します。下の設定を変えたときは「再計算」を押してください。'),
+    );
+    out.push(st);
+
+    // 表示
+    const disp = h('div', { class: 'section' }, h('h3', {}, '表示'), this.climateLayerSelect());
+    const flagsRow = (key: 'latitude' | 'wind', label: string) =>
+      h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: this.host.flags[key], onchange: (e: Event) => { this.host.flags[key] = (e.target as HTMLInputElement).checked; this.host.requestDraw(); } }), label);
+    disp.append(h('div', { class: 'grid2' }, flagsRow('latitude', '緯度相当線'), flagsRow('wind', '卓越風の矢印')));
+    if (c) disp.append(this.climateSummary());
+    out.push(disp);
+
+    // 地点の気候
+    out.push(this.inspectSection());
+
+    // 世界設定
+    const f = w.geoFrame;
+    const [lo, hi] = latitudeRange(f, w.width, w.height, w.kmPerCell);
+    out.push(h('div', { class: 'section' },
+      h('h3', {}, '世界設定（緯度相当）'),
+      h('p', { class: 'note' }, '地図の座標（左上からの km）と、気候計算に使う「緯度相当」は別のものです。Y 座標を緯度とはみなさず、ここで決めた対応で各地点の緯度相当を求めます。'),
+      this.numRow('中心の緯度相当', f.centerLat, '度', 1, (v) => actions.setGeoFrame(store, { centerLat: v }), '地図の中心がどの緯度に相当するか（北が正、南が負）'),
+      this.numRow('北相当の向き', f.northAngle, '度', 5, (v) => actions.setGeoFrame(store, { northAngle: v }), '地図の上方向から時計回りの角度。90 なら地図の右が北相当'),
+      this.numRow('緯度1度の距離', f.kmPerDegree, 'km', 1, (v) => actions.setGeoFrame(store, { kmPerDegree: v }), '地球は約 111 km。小さくすると同じ地図でも緯度の幅が広がる（小さな惑星）'),
+      this.numRow('地軸の傾き', f.axialTilt, '度', 0.5, (v) => actions.setGeoFrame(store, { axialTilt: v }), '大きいほど季節の差が大きくなる（地球は 23.4°）'),
+      h('p', { class: 'note' }, `この地図の範囲：${formatLatitude(lo)} 〜 ${formatLatitude(hi)}（南北 ${Math.round(hi - lo)} 度分）`),
+      lo < -90 || hi > 90 ? h('p', { class: 'note warn' }, '緯度相当が ±90° を超えています。超えた部分は極として扱われます。') : null,
+    ));
+
+    // 気温
+    out.push(h('div', { class: 'section' },
+      h('h3', {}, '気温のパラメータ'),
+      this.numRow('全体の気温補正', p.tempOffset, '°C', 0.5, (v) => actions.setClimateParams(store, { tempOffset: v }), '温暖な世界・寒冷な世界にしたいときに'),
+      this.numRow('気温減率', p.lapseRate, '°C/km', 0.1, (v) => actions.setClimateParams(store, { lapseRate: v }), '標高 1 km あたりの気温の下がり方（地球の平均は約 6.5）'),
+      this.numRow('大陸度の距離', p.continentalityKm, 'km', 50, (v) => actions.setClimateParams(store, { continentalityKm: v }), '海からこの距離ほど離れると大陸性の気候に近づく（風上側の距離を重視）'),
+      this.numRow('海洋性の振れ幅', p.maritimeAmplitude, '倍', 0.01, (v) => actions.setClimateParams(store, { maritimeAmplitude: v }), '海の近くでの季節変化の大きさ（日射の季節変化に対する比）'),
+      this.numRow('大陸性の振れ幅', p.continentalAmplitude, '倍', 0.01, (v) => actions.setClimateParams(store, { continentalAmplitude: v }), '内陸での季節変化の大きさ'),
+      this.numRow('海による高緯度の温暖化', p.oceanWarming, '°C', 0.5, (v) => actions.setClimateParams(store, { oceanWarming: v }), '海流などの効果の代わりに、高緯度の海に近い所を暖かくする'),
+    ));
+
+    // 風と降水
+    const windSel = h('select', { onchange: () => actions.setClimateParams(store, { windMode: windSel.value as 'bands' | 'fixed' }) },
+      h('option', { value: 'bands', selected: p.windMode === 'bands' }, '緯度帯モデル（貿易風・偏西風・極東風）'),
+      h('option', { value: 'fixed', selected: p.windMode === 'fixed' }, '固定の風向'));
+    out.push(h('div', { class: 'section' },
+      h('h3', {}, '卓越風と降水のパラメータ'),
+      h('div', { class: 'row' }, h('label', {}, '卓越風'), windSel),
+      p.windMode === 'fixed' ? this.numRow('風が吹いてくる方角', p.windFrom, '度', 15, (v) => actions.setClimateParams(store, { windFrom: v }), '北相当を 0 として時計回り。270 なら西風') : null,
+      this.numRow('降水帯の季節移動', p.seasonalShift, '度', 0.5, (v) => actions.setClimateParams(store, { seasonalShift: v }), '夏と冬で雨の多い緯度帯がずれる量。大きいほど雨季・乾季がはっきりする'),
+      this.numRow('水蒸気の到達距離', p.moistureLengthKm, 'km', 50, (v) => actions.setClimateParams(store, { moistureLengthKm: v }), '長いほど内陸まで湿る'),
+      this.numRow('地形性降水の強さ', p.orographic, '倍', 0.1, (v) => actions.setClimateParams(store, { orographic: v }), '風上の山で雨が増え、風下が乾く効果の強さ'),
+      this.numRow('降水量の倍率', p.precipScale, '倍', 0.05, (v) => actions.setClimateParams(store, { precipScale: v })),
+      this.numRow('蒸発散による再供給', p.recycling, '割', 0.05, (v) => actions.setClimateParams(store, { recycling: v }), '陸に降った雨が再び水蒸気に戻る割合（0〜0.9）'),
+    ));
+
+    // 計算設定
+    const gridSel = h('select', { onchange: () => actions.setClimateParams(store, { gridFactor: Number(gridSel.value) }) },
+      [1, 2, 4].map((g) => h('option', { value: String(g), selected: p.gridFactor === g }, `${g}×${g} 地形セル（${Math.ceil(w.width / g)}×${Math.ceil(w.height / g)}）`)));
+    const seedIn = h('input', { type: 'number', value: String(p.seed), onchange: () => actions.setClimateParams(store, { seed: Math.abs(Math.floor(Number(seedIn.value))) || 1 }) });
+    out.push(h('div', { class: 'section' },
+      h('h3', {}, '計算の設定'),
+      h('div', { class: 'row' }, h('label', {}, '気候グリッド'), gridSel),
+      h('div', { class: 'row' }, h('label', {}, 'シード'), seedIn, h('button', { class: 'btn small', title: 'ランダム', html: icon('dice', 16), onclick: () => actions.setClimateParams(store, { seed: Math.floor(Math.random() * 1e9) }) })),
+      this.numRow('局所的なゆらぎ', p.variability, '', 0.05, (v) => actions.setClimateParams(store, { variability: v }), '0 でゆらぎなし。シードを変えるとゆらぎの模様が変わる'),
+    ));
+
+    // 分類条件
+    out.push(this.thresholdSection());
+
+    // 検証
+    const issues: ValidationIssue[] = [...sanitizeClimateParams(p).issues];
+    if (c) {
+      for (const i of c.meta.issues) if (!issues.some((j) => j.code === i.code && j.message === i.message)) issues.push(i);
+      for (const i of validateClimate(c, { width: Math.ceil(w.width / c.meta.gridFactor), height: Math.ceil(w.height / c.meta.gridFactor) })) {
+        if (!issues.some((j) => j.code === i.code)) issues.push(i);
+      }
+    }
+    out.push(h('div', { class: 'section' },
+      h('h3', {}, 'データの検証', h('small', {}, issues.length ? `${issues.length} 件` : '問題なし')),
+      h('p', { class: 'note' }, '欠損値・無効値（NaN など）・範囲外の値・大小関係の矛盾・範囲外の設定を調べます。'),
+      issues.length
+        ? h('ul', { class: 'issues' }, issues.map((i) => h('li', { class: i.level }, `${i.level === 'error' ? 'エラー' : i.level === 'warning' ? '注意' : '情報'}：${i.message}${i.count ? `（${i.count} 件）` : ''}`)))
+        : h('ul', { class: 'issues' }, h('li', {}, c ? '問題は見つかりませんでした' : '気候はまだ計算されていません')),
+    ));
+
+    // 前提と限界
+    out.push(h('div', { class: 'section' },
+      h('h3', {}, '計算上の前提と限界'),
+      h('p', { class: 'note' }, 'これは架空世界づくりのための大まかな近似モデルで、実際の気象・気候の予測ではありません。'),
+      h('ol', { class: 'assumptions' }, CLIMATE_ASSUMPTIONS.map((a) => h('li', {}, a))),
+      h('p', { class: 'note' }, `単位：気温 ${CLIMATE_UNITS.temperature}、降水量 ${CLIMATE_UNITS.precipitation}、季節性：年較差 ${CLIMATE_UNITS.temperatureRange}／降水 ${CLIMATE_UNITS.precipitationSeasonality}`),
+    ));
+
+    // 書き出し
+    if (c) {
+      out.push(h('div', { class: 'section' },
+        h('h3', {}, '気候データの書き出し'),
+        h('p', { class: 'note' }, 'セル ID・位置（セル・km）・緯度相当・標高・年平均気温・年降水量・季節性・気候区分・バイオームを CSV で書き出します。先頭の # 行に生成方式・バージョン・単位を記録します。'),
+        h('div', { class: 'btn-row' },
+          h('button', { class: 'btn', onclick: () => downloadBytes(new TextEncoder().encode(climateCsv(c, w.width, w.height, w.kmPerCell, true)), `${safeFilename(w.title)}-climate.csv`, 'text/csv') }, 'CSV（陸のみ）'),
+          h('button', { class: 'btn', onclick: () => downloadBytes(new TextEncoder().encode(climateCsv(c, w.width, w.height, w.kmPerCell, false)), `${safeFilename(w.title)}-climate-all.csv`, 'text/csv') }, 'CSV（海を含む）'),
+        ),
+      ));
+    }
+    return out;
+  }
+
+  private climateSummary(): HTMLElement {
+    const c = this.host.store.world.climate!;
+    const bc = new Map<number, number>();
+    let land = 0;
+    let tSum = 0;
+    let pSum = 0;
+    for (let i = 0; i < c.biome.length; i++) {
+      if (c.land[i] < 0.5) continue;
+      land++;
+      tSum += c.tMean[i];
+      pSum += c.precip[i];
+      bc.set(c.biome[i], (bc.get(c.biome[i]) ?? 0) + 1);
+    }
+    if (!land) return h('p', { class: 'note' }, '陸地がありません。');
+    const top = [...bc].sort((a, b) => b[1] - a[1]).slice(0, 6);
+    return h('div', {},
+      h('dl', { class: 'stats' },
+        h('dt', {}, '陸の平均気温'), h('dd', {}, `${(tSum / land).toFixed(1)} °C`),
+        h('dt', {}, '陸の平均降水量'), h('dd', {}, `${Math.round(pSum / land).toLocaleString()} mm/年`),
+      ),
+      h('div', { class: 'subhead' }, '陸地のバイオーム構成'),
+      h('dl', { class: 'stats' }, top.map(([b, n]) => [
+        h('dt', {}, h('span', { class: 'swatch', style: `background:${BIOMES[b].color}` }), BIOMES[b].label),
+        h('dd', {}, `${((n / land) * 100).toFixed(1)}%`),
+      ])),
+    );
+  }
+
+  private inspectSection(): HTMLElement {
+    const { store } = this.host;
+    const w = store.world;
+    const c = w.climate;
+    const pt = this.host.getInspect();
+    const sec = h('div', { class: 'section' }, h('h3', {}, '地点の気候'));
+    if (!c) return sec.appendChild(h('p', { class: 'note' }, '気候を計算すると、「地点情報」ツールでタップした地点の気候を見られます。')).parentElement as HTMLElement;
+    if (!pt) {
+      sec.append(
+        h('p', { class: 'note' }, '「地点情報」ツールで地図をタップすると、その地点の値と雨温図を表示します。'),
+        h('button', { class: 'btn small', onclick: () => { this.host.setTool('inspect'); this.refreshTools(); } }, '地点情報ツールを使う'),
+      );
+      return sec;
+    }
+    const id = climateCellAt(c, pt.x, pt.y);
+    if (id < 0) return sec.appendChild(h('p', { class: 'note' }, '地図の外です。')).parentElement as HTMLElement;
+    const info = climateCellInfo(c, w.width, w.height, w.kmPerCell, id);
+    const k = info.koppen;
+    const b = BIOMES.find((x) => x.key === info.biome);
+    sec.append(
+      h('dl', { class: 'stats' },
+        h('dt', {}, 'セル ID'), h('dd', {}, `${info.id}（${info.ix}, ${info.iy}）`),
+        h('dt', {}, '位置'), h('dd', {}, `x ${info.xKm.toFixed(0)} km, y ${info.yKm.toFixed(0)} km`),
+        h('dt', {}, '緯度相当'), h('dd', {}, formatLatitude(info.lat)),
+        h('dt', {}, '平均標高'), h('dd', {}, info.land >= 0.5 ? `${Math.round(info.elevation).toLocaleString()} m` : '海'),
+        h('dt', {}, '年平均気温'), h('dd', {}, `${info.tMean.toFixed(1)} °C`),
+        h('dt', {}, '最暖月／最寒月'), h('dd', {}, `${info.tWarm.toFixed(1)} ／ ${info.tCold.toFixed(1)} °C`),
+        h('dt', {}, '気温の年較差'), h('dd', {}, `${info.tRange.toFixed(1)} °C`),
+        info.land >= 0.5 ? [
+          h('dt', {}, '年降水量'), h('dd', {}, `${Math.round(info.precip).toLocaleString()} mm`),
+          h('dt', {}, '降水の季節性'), h('dd', {}, `${info.precipSeasonality.toFixed(2)}（${info.highSun >= 0.5 ? '夏' : '冬'}に多い）`),
+          h('dt', {}, '気候区分'), h('dd', {}, k ? `${k} ${KOPPEN_INFO[k].label}` : '—'),
+          h('dt', {}, 'バイオーム'), h('dd', {}, b?.label ?? '—'),
+        ] : null,
+      ),
+    );
+    if (info.land >= 0.5) sec.append(this.climograph(info));
+    sec.append(
+      h('p', { class: 'note' }, '月別の値は、保存している年平均・最暖月・最寒月・夏冬の降水割合から近似的に描いたものです。'),
+    );
+    return sec;
+  }
+
+  private climograph(info: ClimateCellInfo): HTMLCanvasElement {
+    const dpr = window.devicePixelRatio || 1;
+    const W = 320;
+    const H = 150;
+    const cv = h('canvas', { class: 'climograph', width: W * dpr, height: H * dpr });
+    const ctx = cv.getContext('2d')!;
+    ctx.scale(dpr, dpr);
+    const left = 30;
+    const right = 34;
+    const top = 12;
+    const bottom = 20;
+    const pw = W - left - right;
+    const ph = H - top - bottom;
+    const pMax = Math.max(100, Math.ceil(Math.max(...info.monthlyP) / 50) * 50);
+    const tMin = Math.min(-10, Math.floor(Math.min(...info.monthlyT) / 10) * 10);
+    const tMax = Math.max(30, Math.ceil(Math.max(...info.monthlyT) / 10) * 10);
+    ctx.font = '10px sans-serif';
+    ctx.fillStyle = '#6e6457';
+    ctx.strokeStyle = '#e6dccb';
+    for (let k = 0; k <= 4; k++) {
+      const y = top + (ph * k) / 4;
+      ctx.beginPath();
+      ctx.moveTo(left, y);
+      ctx.lineTo(left + pw, y);
+      ctx.stroke();
+      ctx.textAlign = 'right';
+      ctx.fillText(String(Math.round(tMax - ((tMax - tMin) * k) / 4)), left - 4, y + 3);
+      ctx.textAlign = 'left';
+      ctx.fillText(String(Math.round(pMax - (pMax * k) / 4)), left + pw + 4, y + 3);
+    }
+    const bw = pw / 12;
+    ctx.fillStyle = 'rgba(63, 127, 196, 0.75)';
+    info.monthlyP.forEach((v, m) => {
+      const bh = (v / pMax) * ph;
+      ctx.fillRect(left + m * bw + 2, top + ph - bh, bw - 4, bh);
+    });
+    ctx.strokeStyle = '#d2421f';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    info.monthlyT.forEach((v, m) => {
+      const x = left + m * bw + bw / 2;
+      const y = top + ((tMax - v) / (tMax - tMin)) * ph;
+      if (m === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    ctx.fillStyle = '#6e6457';
+    ctx.textAlign = 'center';
+    for (let m = 0; m < 12; m++) ctx.fillText(String(m + 1), left + m * bw + bw / 2, H - 6);
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#d2421f';
+    ctx.fillText('°C', 2, 10);
+    ctx.fillStyle = '#3f7fc4';
+    ctx.textAlign = 'right';
+    ctx.fillText('mm', W - 2, 10);
+    return cv;
+  }
+
+  private thresholdSection(): HTMLElement {
+    const { store } = this.host;
+    const p = store.world.climateParams;
+    const kRows: [keyof KoppenThresholds, string, string, string][] = [
+      ['tropicalMinCold', 'A：最寒月の下限', '°C', '最寒月平均気温がこれ以上なら熱帯（A）'],
+      ['cdBoundary', 'C/D の境', '°C', '最寒月平均気温がこれより高ければ温帯（C）、以下なら亜寒帯（D）。-3 または 0 が一般的'],
+      ['polarMaxWarm', 'E：最暖月の上限', '°C', '最暖月平均気温がこれ未満なら寒帯（E）'],
+      ['iceMaxWarm', 'EF：最暖月の上限', '°C', '最暖月平均気温がこれ未満なら氷雪気候'],
+      ['aridFactor', 'B：乾燥限界の係数', 'mm/°C', '乾燥限界 = 係数 × 年平均気温 + 補正'],
+      ['aridSummerOffset', 'B：補正（夏雨）', 'mm', '降水の 70% 以上が夏半年のとき'],
+      ['aridEvenOffset', 'B：補正（中間）', 'mm', ''],
+      ['aridWinterOffset', 'B：補正（冬雨）', 'mm', '降水の 70% 以上が冬半年のとき'],
+      ['hotAridMean', 'h/k の境', '°C', '乾燥気候のうち年平均気温がこれ以上なら高温（h）'],
+      ['tropicalWetMonth', 'Af：最少雨月', 'mm', '最少雨月降水量がこれ以上なら熱帯雨林気候'],
+      ['summerDryMax', 's：夏の最少雨月', 'mm', ''],
+      ['summerDryRatio', 's：冬の最多雨月との比', '分の1', ''],
+      ['winterDryRatio', 'w：夏の最多雨月との比', '分の1', ''],
+      ['hotSummer', 'a：最暖月', '°C', '最暖月平均気温がこれ以上なら a'],
+      ['warmMonthTemp', 'b：月平均気温', '°C', ''],
+      ['warmMonths', 'b：その月数', 'か月', ''],
+      ['extremeCold', 'd：最寒月', '°C', '亜寒帯で最寒月平均気温がこれ未満なら d'],
+    ];
+    const bRows: [keyof BiomeThresholds, string, string, string][] = [
+      ['grasslandMaxPrecip', '草原の年降水量', 'mm', '温帯・亜寒帯でこれ未満なら草原（年平均 10°C の場合。寒いほど小さく補正）'],
+      ['temperateRainforestMinPrecip', '温帯雨林', 'mm', '年降水量がこれ以上の冷涼な温帯は温帯雨林'],
+      ['tropicalRainforestMinPrecip', '熱帯雨林', 'mm', 'Af/Am で年降水量がこれ以上なら熱帯雨林、未満なら熱帯季節林'],
+      ['tropicalSeasonalMinPrecip', '熱帯季節林', 'mm', 'Aw/As で年降水量がこれ以上なら熱帯季節林、未満ならサバナ'],
+      ['subtropicalMinTemp', '照葉樹林の気温', '°C', '暑夏の温帯で年平均気温がこれ以上なら照葉樹林'],
+      ['alpineMinElevation', '高山帯の標高', 'm', '寒帯気候のうち、この標高以上（かつ緯度相当 62° 未満）は高山帯'],
+    ];
+    const details = (title: string, body: HTMLElement[]) => {
+      const d = h('details', {}, h('summary', { class: 'subhead', style: 'cursor:pointer' }, title), ...body);
+      return d;
+    };
+    return h('div', { class: 'section' },
+      h('h3', {}, '分類の条件'),
+      h('p', { class: 'note' }, 'ケッペン気候区分（近似）とバイオームを決める閾値です。変更後は「気候を再計算」を押してください。'),
+      details('気候区分（ケッペン）の条件', [
+        ...kRows.map(([key, label, unit, hint]) => this.numRow(label, p.koppen[key], unit, 1, (v) => actions.setClimateParams(store, { koppen: { ...p.koppen, [key]: v } }), hint)),
+        h('button', { class: 'btn small', onclick: () => actions.setClimateParams(store, { koppen: { ...DEFAULT_KOPPEN } }) }, '既定値に戻す'),
+      ]),
+      details('バイオームの条件', [
+        ...bRows.map(([key, label, unit, hint]) => this.numRow(label, p.biome[key], unit, key === 'subtropicalMinTemp' ? 0.5 : 50, (v) => actions.setClimateParams(store, { biome: { ...p.biome, [key]: v } }), hint)),
+        h('button', { class: 'btn small', onclick: () => actions.setClimateParams(store, { biome: { ...DEFAULT_BIOME } }) }, '既定値に戻す'),
+      ]),
+      h('p', { class: 'note' }, `区分コード：${KOPPEN_CODES.filter(Boolean).length} 種類（${KOPPEN_CODES.filter(Boolean).slice(0, 6).join(', ')} …）、バイオーム ${BIOMES.length - 1} 種類`),
+    );
   }
 
   // ---------------------------------------------------------------- 地物タブ
@@ -616,8 +1049,20 @@ export class AppUI {
       const table = h('table', { class: 'list' }, h('thead', {}, h('tr', {}, h('th', {}, '名前'), cols.map(([c]) => h('th', {}, c)))));
       const tb = h('tbody', {});
       for (const f of list) {
-        tb.append(h('tr', { class: 'click', onclick: () => this.host.focusOn(f.x, f.y, Math.max(20, f.extent || f.length / 2 || 20)) },
-          h('td', {}, featureDisplayName(store, f)), cols.map(([, fn]) => h('td', { class: 'num' }, fn(f)))));
+        const auto = featureAutoName(store, f);
+        const custom = featureOverride(store, f);
+        const input: HTMLInputElement = h('input', {
+          class: 'name-input' + (custom ? ' custom' : ''),
+          type: 'text',
+          value: custom?.name ?? auto,
+          placeholder: auto,
+          title: '名前を変更できます（空にすると自動の名前に戻ります）',
+          onclick: (e: Event) => e.stopPropagation(),
+          onkeydown: (e: KeyboardEvent) => { if (e.key === 'Enter') input.blur(); },
+          onchange: () => actions.renameFeature(store, f.kind, f.key, input.value, auto),
+        });
+        tb.append(h('tr', { class: 'click', title: '行をタップすると地図がその場所へ移動します', onclick: () => this.host.focusOn(f.x, f.y, Math.max(20, f.extent || f.length / 2 || 20)) },
+          h('td', {}, input), cols.map(([, fn]) => h('td', { class: 'num' }, fn(f)))));
       }
       table.append(tb);
       return h('div', { class: 'section' }, h('h3', {}, title, h('small', {}, `${list.length} 件`)), table);
@@ -629,6 +1074,7 @@ export class AppUI {
     for (let i = 0; i < a.land.length; i++) landCells += a.land[i];
     const pct = (k: number) => `${(((lfCount.get(k) ?? 0) / Math.max(1, landCells)) * 100).toFixed(1)}%`;
     const sections: (HTMLElement | null)[] = [
+      h('p', { class: 'note' }, '名前の欄をタップすると書き換えられます（空にすると自動の名前に戻ります）。国名・州名・首都名は「データ」タブ、または「区画選択」ツールで変更できます。'),
       h('div', { class: 'section' }, h('h3', {}, '地形の構成'), h('dl', { class: 'stats' },
         h('dt', {}, '平野'), h('dd', {}, pct(2)),
         h('dt', {}, '丘陵'), h('dd', {}, pct(3)),
@@ -878,6 +1324,12 @@ export class AppUI {
       e.preventDefault();
       this.saveToBrowser(false);
     } else if (e.key === 'Escape') {
+      if (this.pendingPick) {
+        this.pendingPick = null;
+        this.showPickHint();
+        this.renderPanel();
+        return;
+      }
       this.host.store.setSelectionPolygon(null);
       this.host.store.select(null);
     }

@@ -1,4 +1,7 @@
+import { prevailingWind } from '../core/climate';
+import { clampLatitude, formatLatitude, latitudeAt, latitudeLines } from '../core/geoframe';
 import type { Feature } from '../core/landforms';
+import { legendFor, type ClimateLayer } from './climate-style';
 import type { Pt } from '../core/raster';
 import type { BorderStroke, Stroke } from '../core/world';
 import { featureDisplayName, LabelPlacer } from './labels';
@@ -16,6 +19,13 @@ export interface LayerFlags {
   grid: boolean;
   sketch: boolean;
   stateFill: boolean;
+  /** 気候レイヤー（none で非表示） */
+  climate: ClimateLayer;
+  climateOpacity: number;
+  /** 卓越風の矢印 */
+  wind: boolean;
+  /** 緯度相当線 */
+  latitude: boolean;
 }
 
 export const DEFAULT_LAYERS: LayerFlags = {
@@ -28,6 +38,10 @@ export const DEFAULT_LAYERS: LayerFlags = {
   grid: false,
   sketch: false,
   stateFill: false,
+  climate: 'none',
+  climateOpacity: 0.85,
+  wind: false,
+  latitude: false,
 };
 
 /** 描画時の座標変換（デバイス px）。scale はセルあたりのデバイス px。 */
@@ -51,6 +65,8 @@ export interface Overlay {
   livePaint?: Uint8Array;
   showRidges?: boolean;
   showBorderStrokes?: boolean;
+  /** 地点情報ツールで調べている地点 */
+  inspect?: { x: number; y: number };
   /** 消しゴム操作中のストローク */
   ridgeOverride?: Stroke[];
   borderOverride?: BorderStroke[];
@@ -107,8 +123,10 @@ export class MapRenderer {
         ctx.fillRect(0, 0, w, h);
       }
       if (mode === 'political') this.drawPoliticalFill(ctx, flags, u);
+      if (flags.climate !== 'none' && flags.climate !== 'temp') this.drawClimate(ctx, flags, flags.relief);
       if (flags.contours && hasTerrain) this.drawContours(ctx, u);
       ctx.restore();
+      if (flags.climate === 'temp') this.drawClimate(ctx, flags, false);
 
       const lake = this.layers.lakePath();
       if (lake) {
@@ -127,6 +145,8 @@ export class MapRenderer {
       if (overlay.livePaint || flags.sketch) this.drawSketch(ctx, overlay.livePaint, tf, 0.5);
     }
     if (flags.grid) this.drawGrid(ctx, u);
+    if (flags.latitude) this.drawLatitudeLines(ctx, tf, u);
+    if (flags.wind) this.drawWind(ctx, tf, u);
     if (overlay.showRidges || overlay.ridgeOverride) this.drawRidgeStrokes(ctx, u, overlay.ridgeOverride);
     if (overlay.showBorderStrokes || overlay.borderOverride) this.drawBorderStrokes(ctx, u, overlay.borderOverride);
     this.drawSelection(ctx, u);
@@ -138,6 +158,19 @@ export class MapRenderer {
     ctx.strokeRect(0, 0, w, h);
 
     if (flags.labels) this.drawLabels(ctx, tf, mode, flags);
+    if (overlay.inspect) {
+      const r = 6 * u;
+      ctx.save();
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 4 * u;
+      ctx.beginPath();
+      ctx.arc(overlay.inspect.x, overlay.inspect.y, r, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.strokeStyle = '#d2421f';
+      ctx.lineWidth = 2 * u;
+      ctx.stroke();
+      ctx.restore();
+    }
     if (overlay.stroke) this.drawStrokePreview(ctx, overlay.stroke, u);
     if (overlay.cursor) {
       ctx.beginPath();
@@ -151,6 +184,164 @@ export class MapRenderer {
     }
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     this.drawScaleBar(ctx, tf, forExport);
+    if (flags.climate !== 'none' && mode !== 'sketch') this.drawLegend(ctx, tf, flags.climate, forExport);
+    ctx.restore();
+  }
+
+  private drawClimate(ctx: CanvasRenderingContext2D, flags: LayerFlags, relief: boolean): void {
+    const { world } = this.store;
+    const c = world.climate;
+    const img = this.layers.climateCanvas(flags.climate);
+    if (!c || !img) return;
+    const f = c.meta.gridFactor;
+    ctx.save();
+    ctx.globalAlpha = flags.climateOpacity;
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(img, 0, 0, c.meta.width * f, c.meta.height * f);
+    ctx.globalAlpha = 1;
+    const rel = relief ? this.layers.reliefCanvas() : null;
+    if (rel) {
+      ctx.globalCompositeOperation = 'multiply';
+      ctx.drawImage(rel, 0, 0, world.width, world.height);
+    }
+    ctx.restore();
+  }
+
+  private drawLatitudeLines(ctx: CanvasRenderingContext2D, tf: DrawTransform, u: number): void {
+    const { world } = this.store;
+    const [a, b] = [latitudeAt(world.geoFrame, world.width, world.height, world.kmPerCell, 0, 0), latitudeAt(world.geoFrame, world.width, world.height, world.kmPerCell, world.width, world.height)];
+    const span = Math.abs(a - b) + 1;
+    const step = [1, 2, 5, 10, 15, 20, 30].find((s) => span / s <= 8) ?? 30;
+    const lines = latitudeLines(world.geoFrame, world.width, world.height, world.kmPerCell, step);
+    ctx.save();
+    ctx.strokeStyle = 'rgba(30, 50, 90, 0.55)';
+    ctx.lineWidth = 1 * u;
+    ctx.setLineDash([8 * u, 5 * u]);
+    for (const l of lines) {
+      ctx.beginPath();
+      ctx.moveTo(l.a[0], l.a[1]);
+      ctx.lineTo(l.b[0], l.b[1]);
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.font = `${10 * tf.ui}px ${SANS}`;
+    ctx.textBaseline = 'bottom';
+    for (const l of lines) {
+      // 地図の左寄りの端にラベル
+      const p = l.a[0] <= l.b[0] ? l.a : l.b;
+      const sx = p[0] * tf.scale + tf.ox + 4 * tf.ui;
+      const sy = p[1] * tf.scale + tf.oy - 2 * tf.ui;
+      const text = formatLatitude(l.lat);
+      ctx.lineWidth = 3 * tf.ui;
+      ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+      ctx.strokeText(text, sx, sy);
+      ctx.fillStyle = '#1e3260';
+      ctx.fillText(text, sx, sy);
+    }
+    ctx.restore();
+  }
+
+  private drawWind(ctx: CanvasRenderingContext2D, tf: DrawTransform, u: number): void {
+    const { world } = this.store;
+    const spacingPx = 64 * tf.ui;
+    const step = Math.max(2, spacingPx / tf.scale);
+    const x0 = Math.max(0, -tf.ox / tf.scale);
+    const y0 = Math.max(0, -tf.oy / tf.scale);
+    const x1 = Math.min(world.width, (tf.width - tf.ox) / tf.scale);
+    const y1 = Math.min(world.height, (tf.height - tf.oy) / tf.scale);
+    const len = step * 0.42;
+    ctx.save();
+    ctx.strokeStyle = 'rgba(20, 30, 50, 0.7)';
+    ctx.fillStyle = 'rgba(20, 30, 50, 0.7)';
+    ctx.lineWidth = 1.4 * u;
+    ctx.lineCap = 'round';
+    for (let y = Math.floor(y0 / step) * step + step / 2; y < y1; y += step) {
+      for (let x = Math.floor(x0 / step) * step + step / 2; x < x1; x += step) {
+        const lat = clampLatitude(latitudeAt(world.geoFrame, world.width, world.height, world.kmPerCell, x, y));
+        const [vx, vy, mag] = prevailingWind(world.geoFrame, world.climateParams, lat);
+        if (mag < 0.15) {
+          ctx.beginPath();
+          ctx.arc(x, y, 2 * u, 0, Math.PI * 2);
+          ctx.stroke();
+          continue;
+        }
+        const l = len * Math.min(1, 0.4 + mag);
+        const ax = x - vx * l;
+        const ay = y - vy * l;
+        const bx = x + vx * l;
+        const by = y + vy * l;
+        ctx.beginPath();
+        ctx.moveTo(ax, ay);
+        ctx.lineTo(bx, by);
+        ctx.stroke();
+        const hx = -vx * 6 * u;
+        const hy = -vy * 6 * u;
+        ctx.beginPath();
+        ctx.moveTo(bx, by);
+        ctx.lineTo(bx + hx - hy * 0.6, by + hy + hx * 0.6);
+        ctx.lineTo(bx + hx + hy * 0.6, by + hy - hx * 0.6);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+
+  private drawLegend(ctx: CanvasRenderingContext2D, tf: DrawTransform, layer: ClimateLayer, forExport: boolean): void {
+    const c = this.store.world.climate;
+    if (!c) return;
+    const lg = legendFor(layer, c);
+    if (!lg) return;
+    const ui = tf.ui;
+    const pad = 8 * ui;
+    const x = (forExport ? 18 : 12) * ui;
+    let y = (forExport ? 84 : 12) * ui;
+    const width = 210 * ui;
+    const items = lg.items?.slice(0, 14) ?? [];
+    const height = lg.ramp ? 58 * ui : (26 + items.length * 15 + (lg.items && lg.items.length > items.length ? 14 : 0)) * ui;
+    ctx.save();
+    ctx.fillStyle = 'rgba(255, 252, 244, 0.9)';
+    ctx.strokeStyle = 'rgba(80, 60, 40, 0.4)';
+    ctx.lineWidth = 1 * ui;
+    ctx.fillRect(x, y, width, height);
+    ctx.strokeRect(x, y, width, height);
+    ctx.fillStyle = '#2b2420';
+    ctx.font = `bold ${11 * ui}px ${SANS}`;
+    ctx.textBaseline = 'top';
+    ctx.fillText(lg.title, x + pad, y + pad);
+    y += 24 * ui;
+    if (lg.ramp) {
+      const { stops, ticks, format } = lg.ramp;
+      const x0 = x + pad;
+      const w = width - pad * 2;
+      const lo = stops[0][0];
+      const hi = stops[stops.length - 1][0];
+      const grad = ctx.createLinearGradient(x0, 0, x0 + w, 0);
+      for (const [v, col] of stops) grad.addColorStop((v - lo) / (hi - lo), col);
+      ctx.fillStyle = grad;
+      ctx.fillRect(x0, y, w, 10 * ui);
+      ctx.fillStyle = '#2b2420';
+      ctx.font = `${9.5 * ui}px ${SANS}`;
+      ctx.textAlign = 'center';
+      for (const t of ticks) {
+        const tx = x0 + ((t - lo) / (hi - lo)) * w;
+        ctx.fillRect(tx - 0.5 * ui, y + 10 * ui, 1 * ui, 3 * ui);
+        ctx.fillText(format(t), Math.min(x0 + w - 10 * ui, Math.max(x0 + 10 * ui, tx)), y + 14 * ui);
+      }
+    } else {
+      ctx.font = `${10 * ui}px ${SANS}`;
+      for (const it of items) {
+        ctx.fillStyle = it.color;
+        ctx.fillRect(x + pad, y + 1 * ui, 12 * ui, 10 * ui);
+        ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+        ctx.strokeRect(x + pad, y + 1 * ui, 12 * ui, 10 * ui);
+        ctx.fillStyle = '#2b2420';
+        ctx.fillText(it.label, x + pad + 18 * ui, y);
+        y += 15 * ui;
+      }
+      if (lg.items && lg.items.length > items.length) ctx.fillText(`ほか ${lg.items.length - items.length} 種類`, x + pad, y);
+    }
     ctx.restore();
   }
 
@@ -481,7 +672,8 @@ export class MapRenderer {
             const rec = labels.states[s.index];
             if (s.cells === 0 || !rec.anchors[0]) continue;
             const country = s.country >= 0 ? labels.countries[s.country] : null;
-            if (country && rec.seat === country.capital) continue;
+            const cap = country?.anchors[0];
+            if (cap && cap[0] === rec.anchors[0][0] && cap[1] === rec.anchors[0][1]) continue;
             const [sx, sy] = toS(rec.anchors[0][0] + 0.5, rec.anchors[0][1] + 0.5);
             this.drawCapital(ctx, placer, sx, sy, rec.seat, ui, false);
           }

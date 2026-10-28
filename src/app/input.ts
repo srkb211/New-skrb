@@ -28,6 +28,9 @@ export interface InputHost {
   resetLive: (paint: Uint8Array) => void;
   onError: (e: unknown) => void;
   onSelectAt: (x: number, y: number) => void;
+  /** 地点の指定待ち（首都の位置など）か */
+  pickActive: () => boolean;
+  onPick: (x: number, y: number) => void;
 }
 
 type Action =
@@ -36,7 +39,7 @@ type Action =
   | { kind: 'paint'; paint: Uint8Array; last: Pt; value: number; radius: number; points: Pt[] }
   | { kind: 'line'; points: Pt[] }
   | { kind: 'erase-strokes'; target: 'ridge' | 'border'; strokes: Stroke[]; touched: Pt[][]; last: Pt | null }
-  | { kind: 'tap'; x: number; y: number; moved: boolean }
+  | { kind: 'tap'; x: number; y: number; moved: boolean; pick?: boolean }
   | { kind: 'pinch'; dist: number; midX: number; midY: number };
 
 /** ポインタ（マウス・タッチ・ペン）入力をツール操作に変換する */
@@ -91,6 +94,10 @@ export class InputController {
       return;
     }
     if (this.pointers.size > 2) return;
+    if (this.host.pickActive() && e.button === 0) {
+      this.action = { kind: 'tap', x, y, moved: false, pick: true };
+      return;
+    }
     const tool = this.host.tool();
     if (tool === 'pan' || e.button === 1 || e.button === 2 || this.spaceDown) {
       this.action = { kind: 'pan', lastX: x, lastY: y };
@@ -130,6 +137,7 @@ export class InputController {
         break;
       case 'fill':
       case 'select':
+      case 'inspect':
         this.action = { kind: 'tap', x, y, moved: false };
         break;
     }
@@ -236,8 +244,9 @@ export class InputController {
           break;
         case 'tap': {
           const [wx, wy] = this.world(a.x, a.y);
-          if (tool === 'fill') actions.fillAt(store, wx, wy, this.host.settings().fillTarget, this.host.settings().gap);
-          else if (tool === 'select') this.host.onSelectAt(wx, wy);
+          if (a.pick) this.host.onPick(wx, wy);
+          else if (tool === 'fill') actions.fillAt(store, wx, wy, this.host.settings().fillTarget, this.host.settings().gap);
+          else if (tool === 'select' || tool === 'inspect') this.host.onSelectAt(wx, wy);
           break;
         }
       }

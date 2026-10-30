@@ -66,8 +66,38 @@ export async function buildMapPng(store: Store, renderer: MapRenderer, mode: Vie
   return insertChunk(png, MAP_CHUNK, data);
 }
 
-export function downloadBytes(bytes: Uint8Array, filename: string, type: string): void {
+interface DownloadsApi {
+  save(req: { filename: string; data: Blob }): Promise<{ status: string }>;
+}
+
+/** claude.ai 上で公開したページでは、通常のダウンロードが使えないので保存の仕組みを借りる */
+let downloadsApi: Promise<DownloadsApi | null> | null = null;
+function claudeDownloads(): Promise<DownloadsApi | null> {
+  const c = (window as unknown as { claude?: { use?: (n: string) => Promise<unknown> } }).claude;
+  if (!c?.use) return Promise.resolve(null);
+  downloadsApi ??= c.use('downloads').then((d) => (d as DownloadsApi | null) ?? null, () => null);
+  return downloadsApi;
+}
+
+/**
+ * ファイルを保存する。claude.ai 上なら確認画面を出して保存し、それ以外は通常のダウンロード。
+ * 保存しなかった（取り消した）ときは false。
+ */
+export async function downloadBytes(bytes: Uint8Array, filename: string, type: string): Promise<boolean> {
   const blob = new Blob([bytes as BlobPart], { type });
+  const api = await claudeDownloads();
+  if (api) {
+    try {
+      await api.save({ filename, data: blob });
+      return true;
+    } catch (e) {
+      const code = (e as { code?: string })?.code;
+      if (code === 'declined') return false;
+      if (code !== 'unavailable' && code !== 'not_granted' && code !== 'capability_disabled' && code !== 'capability_removed') {
+        throw new Error(`保存できませんでした（${code ?? '不明なエラー'}）`);
+      }
+    }
+  }
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -76,6 +106,7 @@ export function downloadBytes(bytes: Uint8Array, filename: string, type: string)
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  return true;
 }
 
 export function safeFilename(title: string): string {

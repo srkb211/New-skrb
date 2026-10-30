@@ -543,7 +543,7 @@ export class AppUI {
         h('div', { class: 'btn-row' },
           h('button', { class: 'btn', onclick: () => {
             const json = JSON.stringify(politicalGeoJSON(store), null, 1);
-            downloadBytes(new TextEncoder().encode(json), `${safeFilename(w.title)}.geojson`, 'application/geo+json');
+            downloadBytes(new TextEncoder().encode(json), `${safeFilename(w.title)}.geo.json`, 'application/geo+json').catch((e) => this.error(e));
           } }, 'GeoJSON を書き出す'),
         ),
       ),
@@ -923,8 +923,8 @@ export class AppUI {
         h('h3', {}, '気候データの書き出し'),
         h('p', { class: 'note' }, 'セル ID・位置（セル・km）・緯度相当・標高・年平均気温・年降水量・季節性・気候区分・バイオームを CSV で書き出します。先頭の # 行に生成方式・バージョン・単位を記録します。'),
         h('div', { class: 'btn-row' },
-          h('button', { class: 'btn', onclick: () => downloadBytes(new TextEncoder().encode(climateCsv(c, w.width, w.height, w.kmPerCell, true)), `${safeFilename(w.title)}-climate.csv`, 'text/csv') }, 'CSV（陸のみ）'),
-          h('button', { class: 'btn', onclick: () => downloadBytes(new TextEncoder().encode(climateCsv(c, w.width, w.height, w.kmPerCell, false)), `${safeFilename(w.title)}-climate-all.csv`, 'text/csv') }, 'CSV（海を含む）'),
+          h('button', { class: 'btn', onclick: () => downloadBytes(new TextEncoder().encode(climateCsv(c, w.width, w.height, w.kmPerCell, true)), `${safeFilename(w.title)}-climate.csv`, 'text/csv').catch((e) => this.error(e)) }, 'CSV（陸のみ）'),
+          h('button', { class: 'btn', onclick: () => downloadBytes(new TextEncoder().encode(climateCsv(c, w.width, w.height, w.kmPerCell, false)), `${safeFilename(w.title)}-climate-all.csv`, 'text/csv').catch((e) => this.error(e)) }, 'CSV（海を含む）'),
         ),
       ));
     }
@@ -1344,8 +1344,9 @@ export class AppUI {
               await new Promise((r) => setTimeout(r, 30));
               return buildMapPng(store, this.host.renderer, this.exportMode, this.host.flags, this.exportScale);
             });
-            downloadBytes(bytes, `${safeFilename(w.title)}.png`, 'image/png');
-            this.toast(`画像を保存しました（${(bytes.length / 1024 / 1024).toFixed(1)} MB）`);
+            if (await downloadBytes(bytes, `${safeFilename(w.title)}.png`, 'image/png')) {
+              this.toast(`画像を保存しました（${(bytes.length / 1024 / 1024).toFixed(1)} MB）`);
+            }
           } catch (e) {
             this.error(e);
           }

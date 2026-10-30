@@ -1,6 +1,7 @@
 import { unzlibSync, zlibSync } from 'fflate';
 import { validateClimate, withClimateDefaults, type ClimateData, type ClimateMeta, type ValidationIssue } from './climate';
 import { DEFAULT_GEO_FRAME } from './geoframe';
+import { WESTERN_CULTURES } from './names';
 import { extractChunk, insertChunk, isPng, MAP_CHUNK } from './png';
 import { DEFAULT_PARAMS, type WorldState } from './world';
 
@@ -54,6 +55,7 @@ interface Meta {
   climateParams?: WorldState['climateParams'];
   terrainMeta?: NonNullable<WorldState['terrain']>['meta'];
   climateMeta?: ClimateMeta;
+  nameCultures?: string[];
   blobs: BlobMeta[];
 }
 
@@ -146,6 +148,7 @@ export function encodeWorld(world: WorldState): Uint8Array {
     climateParams: world.climateParams,
     terrainMeta: world.terrain?.meta,
     climateMeta: c?.meta,
+    nameCultures: world.nameCultures,
     blobs: blobs.map((b) => b.meta),
   };
   const json = new TextEncoder().encode(JSON.stringify(meta));
@@ -284,6 +287,7 @@ export function decodeWorldChecked(bytes: Uint8Array): DecodeResult {
     geoFrame: { ...DEFAULT_GEO_FRAME, ...(meta.geoFrame ?? {}) },
     climateParams: withClimateDefaults(meta.climateParams ?? { seed: meta.seed ?? 1 }),
     climate,
+    nameCultures: meta.nameCultures?.length ? meta.nameCultures : [...WESTERN_CULTURES],
   };
   return { world, issues };
 }

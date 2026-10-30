@@ -137,6 +137,7 @@ async function boot(): Promise<void> {
       if (paint !== store.world.paint) renderer.layers.sketchCanvas(paint);
     },
     onError: (e) => ui.error(e),
+    notify: (m) => ui.toast(m),
     pickActive: () => ui.pendingPick !== null,
     onPick: (x, y) => ui.completePick(x, y),
     onSelectAt: (x, y) => {

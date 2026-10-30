@@ -6,6 +6,7 @@ import * as actions from './actions';
 import type { Overlay } from './renderer';
 import type { Store } from './store';
 import type { ToolId, ToolSettings } from './tools';
+import type { TerritoryTarget } from '../core/edits';
 import type { View } from './view';
 
 interface Pointer {
@@ -28,6 +29,8 @@ export interface InputHost {
   resetLive: (paint: Uint8Array) => void;
   onError: (e: unknown) => void;
   onSelectAt: (x: number, y: number) => void;
+  /** 操作の結果を短く知らせる */
+  notify: (message: string) => void;
   /** 地点の指定待ち（首都の位置など）か */
   pickActive: () => boolean;
   onPick: (x: number, y: number) => void;
@@ -38,6 +41,7 @@ type Action =
   | { kind: 'pan'; lastX: number; lastY: number }
   | { kind: 'paint'; paint: Uint8Array; last: Pt; value: number; radius: number; points: Pt[] }
   | { kind: 'line'; points: Pt[] }
+  | { kind: 'territory'; points: Pt[]; target: { target: TerritoryTarget; color: string } }
   | { kind: 'erase-strokes'; target: 'ridge' | 'border'; strokes: Stroke[]; touched: Pt[][]; last: Pt | null }
   | { kind: 'tap'; x: number; y: number; moved: boolean; pick?: boolean }
   | { kind: 'pinch'; dist: number; midX: number; midY: number };
@@ -120,6 +124,17 @@ export class InputController {
         this.stamp([p]);
         break;
       }
+      case 'territory': {
+        const target = this.resolveTerritoryTarget(p);
+        if (!target) {
+          this.host.notify('領土ブラシは、広げたい国（州）の陸地の中から描き始めてください');
+          this.action = { kind: 'none' };
+          return;
+        }
+        this.action = { kind: 'territory', points: [p], target };
+        this.host.overlay.stroke = { points: [p], style: 'territory', color: target.color, radius: st.brush };
+        break;
+      }
       case 'ridge':
       case 'national':
       case 'state':
@@ -177,6 +192,12 @@ export class InputController {
         a.points.push(p);
         break;
       }
+      case 'territory': {
+        const p = this.world(x, y);
+        a.points.push(p);
+        this.host.overlay.stroke!.points = a.points;
+        break;
+      }
       case 'line': {
         const p = this.world(x, y);
         const last = a.points[a.points.length - 1];
@@ -230,8 +251,19 @@ export class InputController {
             actions.addRidge(store, pts).catch(this.host.onError);
           } else if (tool === 'national' || tool === 'state') {
             const r = Math.max(2, 16 / this.host.view.scale);
-            actions.addBorder(store, tool, pts, r, this.host.settings().snap);
+            const msg = actions.addBorder(store, tool, pts, r, this.host.settings().snap);
+            if (msg) this.host.notify(msg);
           }
+          break;
+        }
+        case 'territory': {
+          this.host.overlay.stroke = undefined;
+          const { world } = store;
+          const cells: number[] = [];
+          stampPolyline(a.points, this.host.settings().brush, world.width, world.height, (i) => {
+            if (store.land[i]) cells.push(i);
+          });
+          if (!actions.paintTerritoryAction(store, cells, a.target.target)) this.host.notify('塗った所に陸地がありませんでした');
           break;
         }
         case 'erase-strokes':
@@ -276,6 +308,38 @@ export class InputController {
     this.host.overlay.borderOverride = undefined;
     this.action = { kind: 'none' };
     this.host.requestDraw();
+  }
+
+  /** 領土ブラシの対象（描き始めの地点か、設定で選んだ国・州） */
+  private resolveTerritoryTarget(p: Pt): { target: TerritoryTarget; color: string } | null {
+    const { store } = this.host;
+    const pol = store.political;
+    if (!pol) return null;
+    const st = this.host.settings();
+    const { labels } = pol;
+    const t = st.territoryTarget;
+    if (t === 'new') return { target: { kind: 'new' }, color: '#888888' };
+    if (t.startsWith('c:') || t.startsWith('s:')) {
+      const id = Number(t.slice(2));
+      if (t[0] === 'c') {
+        const idx = labels.countries.findIndex((c) => c.id === id);
+        if (idx >= 0) return { target: { kind: 'country', index: idx }, color: labels.countries[idx].color };
+      } else {
+        const idx = labels.states.findIndex((s) => s.id === id);
+        const ci = pol.stats.states[idx]?.country ?? -1;
+        if (idx >= 0) return { target: { kind: 'state', index: idx }, color: ci >= 0 ? labels.countries[ci].color : '#888888' };
+      }
+      return null;
+    }
+    const w = store.world.width;
+    const cx = Math.floor(p[0]);
+    const cy = Math.floor(p[1]);
+    if (cx < 0 || cy < 0 || cx >= w || cy >= store.world.height) return null;
+    const cell = cy * w + cx;
+    const ci = labels.country[cell];
+    if (ci < 0) return null;
+    if (st.territoryLevel === 'state' && labels.state[cell] >= 0) return { target: { kind: 'state', index: labels.state[cell] }, color: labels.countries[ci].color };
+    return { target: { kind: 'country', index: ci }, color: labels.countries[ci].color };
   }
 
   private stamp(pts: Pt[]): void {
@@ -337,7 +401,7 @@ export class InputController {
   private updateCursor(sx: number, sy: number, type: string): void {
     const tool = this.host.tool();
     const st = this.host.settings();
-    const brushTools: ToolId[] = ['land', 'sea', 'erase', 'outline', 'ridge-erase', 'border-erase'];
+    const brushTools: ToolId[] = ['land', 'sea', 'erase', 'outline', 'ridge-erase', 'border-erase', 'territory'];
     if (!brushTools.includes(tool) || (type === 'touch' && this.pointers.size === 0)) {
       if (this.host.overlay.cursor) {
         this.host.overlay.cursor = undefined;

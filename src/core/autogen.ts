@@ -11,6 +11,8 @@ export interface AutoPoliticalOptions {
   countries: number;
   statesPerCountry: number;
   seed: number;
+  /** 使う命名文化（省略時は西洋系） */
+  cultures?: readonly string[];
 }
 
 export interface TerrainHints {
@@ -183,6 +185,8 @@ export function bordersFromLabels(
   include: (left: number, right: number) => boolean,
   kind: 'national' | 'state',
   nextId: () => number,
+  /** true ならセルの角をそのままたどる（読み直すと元の区画と完全に一致する） */
+  exact = false,
 ): BorderStroke[] {
   const topo = buildTopology(grid, w, h);
   const out: BorderStroke[] = [];
@@ -195,6 +199,10 @@ export function bordersFromLabels(
   };
   for (const arc of topo.arcs) {
     if (arc.left < 0 || arc.right < 0 || !include(arc.left, arc.right)) continue;
+    if (exact) {
+      out.push({ id: nextId(), kind, points: arc.points.map(([x, y]) => [x, y] as Pt) });
+      continue;
+    }
     let pts: Pt[] = chaikin(simplify(arc.points, 0.9), 1);
     // 海に接する端点は海側のセルまで延ばし、区画が確実に閉じるようにする
     const a = arc.points[0];
@@ -326,7 +334,7 @@ export function autoGeneratePolitical(
   const reg: NameRegistry = newRegistry();
   const countries: CountryRecord[] = seeds.map((s) => {
     const r = rngFor(opts.seed, 3, s);
-    const culture = pickCulture(r);
+    const culture = pickCulture(r, opts.cultures);
     return {
       id: nextId(),
       name: countryName(r, culture, reg),

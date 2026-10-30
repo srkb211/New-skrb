@@ -11,6 +11,7 @@ export type ToolId =
   | 'national'
   | 'state'
   | 'border-erase'
+  | 'territory'
   | 'select'
   | 'inspect';
 
@@ -34,6 +35,7 @@ export const TOOLS: ToolDef[] = [
   { id: 'national', label: '国境ペン', group: 'political', hint: '国境を描きます。端は近くの海岸や他の境界線に自動でつながります' },
   { id: 'state', label: '州境ペン', group: 'political', hint: '国の中を区切る州境を描きます' },
   { id: 'border-erase', label: '境界消し', group: 'political', hint: 'なぞった所の国境・州境を消します' },
+  { id: 'territory', label: '領土ブラシ', group: 'political', hint: '広げたい国の中から描き始め、取り込みたい所をなぞると、その国の領土になります（国境は自動で引き直されます）' },
   { id: 'select', label: '区画選択', group: 'political', hint: '国や州をタップして情報を見たり名前を変えたりします' },
   { id: 'inspect', label: '地点情報', group: 'climate', hint: 'タップした地点の気温・降水量・気候区分・バイオームを表示します' },
 ];
@@ -56,6 +58,10 @@ export interface ToolSettings {
   gap: number;
   /** 境界線を海岸や他の線へ自動でつなぐ */
   snap: boolean;
+  /** 領土ブラシで塗る単位 */
+  territoryLevel: 'country' | 'state';
+  /** 領土ブラシの対象：start = 描き始めた所の国（州）、new = 新しい国、c:ID / s:ID = 指定 */
+  territoryTarget: string;
 }
 
 export const DEFAULT_TOOL_SETTINGS: ToolSettings = {
@@ -64,4 +70,6 @@ export const DEFAULT_TOOL_SETTINGS: ToolSettings = {
   fillTarget: 'land',
   gap: 2,
   snap: true,
+  territoryLevel: 'country',
+  territoryTarget: 'start',
 };

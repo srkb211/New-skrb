@@ -130,3 +130,64 @@ describe('regenerateCountryStates', () => {
     for (let i = 0; i < w * h; i++) expect(after.country[i]).toBe(before.country[i]);
   });
 });
+
+describe('国境線の扱い（意図どおりの形）', () => {
+  const w = 80;
+  const h = 60;
+  const derive = (land: Uint8Array, borders: BorderStroke[], countries: CountryRecord[] = []) =>
+    derivePolitical({ land, w, h, borders, countries, states: [], seed: 1, nextId: 100 });
+
+  it('区画の境目は描いた線に沿い、どちらかに 1 セルずれない', () => {
+    const land = new Uint8Array(w * h).fill(1);
+    // セルの角を通る縦線 x=40：x<40 が西、x>=40 が東
+    const r = derive(land, [{ id: 1, kind: 'national', points: [[40, 0], [40, 60]] }]);
+    for (let y = 0; y < h; y++) {
+      expect(r.country[y * w + 39]).toBe(r.country[30 * w + 10]);
+      expect(r.country[y * w + 40]).toBe(r.country[30 * w + 70]);
+    }
+    // 斜めの線でも、セル中心が線のどちら側にあるかで決まる
+    const d = derive(land, [{ id: 1, kind: 'national', points: [[10, 0], [70, 60]] }]);
+    const upper = d.country[5 * w + 60];
+    let wrong = 0;
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++) {
+        const side = (60 * (y + 0.5 - 0) - 60 * (x + 0.5 - 10)); // cross((60,60),(p-a))
+        if (Math.abs(side) < 1e-9) continue;
+        const expectUpper = side < 0;
+        if ((d.country[y * w + x] === upper) !== expectUpper) wrong++;
+      }
+    expect(wrong).toBe(0);
+  });
+
+  it('国境線で囲んだ小さな国も消えずに国になる（細い切れ端は除く）', () => {
+    const land = disk(w, h, 40, 30, 25);
+    const loop: [number, number][] = [];
+    for (let k = 0; k <= 32; k++) {
+      const a = (k / 32) * Math.PI * 2;
+      loop.push([30 + Math.cos(a) * 3.5, 30 + Math.sin(a) * 3.5]);
+    }
+    const r = derive(land, [{ id: 1, kind: 'national', points: loop }]);
+    expect(r.countries.length).toBe(2);
+    expect(r.country[30 * w + 30]).not.toBe(r.country[30 * w + 50]);
+    // 2 本の平行線の間の細い帯は国にならない
+    const thin = derive(land, [
+      { id: 1, kind: 'national', points: [[40, 0], [40, 60]] },
+      { id: 2, kind: 'national', points: [[41.5, 0], [41.5, 60]] },
+    ]);
+    expect(thin.countries.length).toBe(2);
+  });
+
+  it('海の上に引いた国境線で、小島の所属を決められる', () => {
+    const land = new Uint8Array(w * h);
+    for (let y = 10; y < 50; y++) for (let x = 5; x < 70; x++) land[y * w + x] = 1;
+    land[55 * w + 30] = 1;
+    land[55 * w + 31] = 1;
+    // 本土を x=34 で東西に分け、その線を海の上で西へ曲げる（小島は西の国に近いが線の東側）
+    const border: BorderStroke = { id: 1, kind: 'national', points: [[34, 0], [34, 50], [24, 60]] };
+    const r = derive(land, [border]);
+    const west = r.country[30 * w + 10];
+    const east = r.country[30 * w + 60];
+    expect(west).not.toBe(east);
+    expect(r.country[55 * w + 30]).toBe(east);
+  });
+});

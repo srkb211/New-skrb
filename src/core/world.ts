@@ -1,6 +1,6 @@
 import { withClimateDefaults, type ClimateData, type ClimateParams } from './climate';
 import { DEFAULT_GEO_FRAME, type GeoFrame } from './geoframe';
-import type { FeatureKind } from './names';
+import { WESTERN_CULTURES, type FeatureKind } from './names';
 import type { Pt } from './raster';
 
 /** 下絵ペイントの値 */
@@ -121,6 +121,8 @@ export interface WorldState {
   climateParams: ClimateParams;
   /** 計算済みの気候（地形と同じく履歴・保存の対象） */
   climate: ClimateData | null;
+  /** 自動で名前を付けるときに使う命名文化（既定は西洋系のみ） */
+  nameCultures: string[];
 }
 
 export function createWorld(width: number, height: number, seed: number): WorldState {
@@ -143,6 +145,7 @@ export function createWorld(width: number, height: number, seed: number): WorldS
     geoFrame: { ...DEFAULT_GEO_FRAME },
     climateParams: withClimateDefaults({ seed }),
     climate: null,
+    nameCultures: [...WESTERN_CULTURES],
   };
 }
 

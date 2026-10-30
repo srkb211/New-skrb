@@ -13,12 +13,18 @@ export interface Culture {
   govs: readonly (readonly [string, number])[];
   subdivisions: readonly string[];
   kanji?: boolean;
+  /** 西洋（ヨーロッパ）系の命名か */
+  western: boolean;
+  /** 自動で選ぶときの重み */
+  weight: number;
 }
 
 export const CULTURES: readonly Culture[] = [
   {
     key: 'west',
-    label: '西方風',
+    label: 'ラテン風（南欧）',
+    western: true,
+    weight: 3,
     syllables: ['ア', 'ル', 'ヴェ', 'リ', 'マ', 'サ', 'テ', 'ナ', 'ロ', 'ベ', 'カ', 'ラ', 'ソ', 'フィ', 'ミ', 'ジ', 'ヴァ', 'セ', 'ト', 'ノ', 'レ', 'ヴィ', 'オ', 'エ', 'ガ', 'ダ', 'パ', 'ヴォ', 'ルカ', 'ラン', 'エル', 'モン', 'カル', 'ベル'],
     countrySuffix: ['ア', 'ニア', 'リア', 'ーナ', 'ヴィア', 'ディア', 'ティア', 'ーノ', 'ンテ'],
     citySuffix: ['ーラ', 'ーノ', 'ッサ', 'ンテ', 'ーナ', 'リオ', 'ーネ', 'ツィア', 'ーレ'],
@@ -27,7 +33,9 @@ export const CULTURES: readonly Culture[] = [
   },
   {
     key: 'north',
-    label: '北方風',
+    label: 'ゲルマン・北欧風',
+    western: true,
+    weight: 3,
     syllables: ['ヴァル', 'ハイ', 'ゲル', 'ブル', 'ノル', 'スト', 'ルン', 'ドル', 'ヘル', 'フロ', 'ガン', 'ヴィン', 'エル', 'オス', 'ラグ', 'ベル', 'ムン', 'トル', 'シュ', 'ヴォル', 'イェル', 'スヴェ', 'アル', 'クラ', 'ディル', 'ホル'],
     countrySuffix: ['ラント', 'ヘイム', 'ガルド', 'マルク', 'ブルク', 'ンド', 'ヴァルト', 'ルク'],
     citySuffix: ['ブルク', 'ハイム', 'シュタット', 'ヴィク', 'ホルム', 'ガルド', 'ドルフ', 'フルト'],
@@ -36,7 +44,9 @@ export const CULTURES: readonly Culture[] = [
   },
   {
     key: 'east',
-    label: '東方風',
+    label: 'スラヴ風（東欧）',
+    western: true,
+    weight: 2,
     syllables: ['ヴォ', 'ロ', 'ミ', 'スラ', 'ヴ', 'ボ', 'ラ', 'ツィ', 'ド', 'ネ', 'ゴ', 'ル', 'カ', 'ザ', 'ヤ', 'ミル', 'グラ', 'ヴェ', 'チェ', 'ジ', 'プ', 'リュ', 'スヴィ', 'トヴェ', 'クラ'],
     countrySuffix: ['ヴィア', 'スク', 'ニア', 'ヴァ', 'ルシ', 'ミア', 'ーヴィナ'],
     citySuffix: ['グラード', 'スク', 'ヴァ', 'ニツァ', 'ポリ', 'ゴロド', 'ヴェツ', 'ノフ'],
@@ -44,8 +54,32 @@ export const CULTURES: readonly Culture[] = [
     subdivisions: ['州', '県', '管区'],
   },
   {
+    key: 'isles',
+    label: '英国・ケルト風',
+    western: true,
+    weight: 2.5,
+    syllables: ['ブラ', 'キル', 'グレン', 'ダン', 'モア', 'ロス', 'アバ', 'ケア', 'ウェン', 'ハル', 'リン', 'ベン', 'タラ', 'カー', 'ドゥ', 'フィン', 'エル', 'ノー', 'ウィン', 'ブリ', 'コル', 'マー', 'ラン', 'ストー', 'アッシュ', 'ウェル'],
+    countrySuffix: ['ランド', 'ニア', 'シャー', 'ウェイ', 'モア', 'ア', 'ダル'],
+    citySuffix: ['トン', 'フォード', 'ウィック', 'ベリー', 'チェスター', 'ハム', 'ブリッジ', 'ポート', 'ワース', 'ミンスター'],
+    govs: [['王国', 5], ['連合王国', 2], ['公国', 1], ['共和国', 2], ['連邦', 1]],
+    subdivisions: ['州', '伯領', '郡'],
+  },
+  {
+    key: 'hellenic',
+    label: 'ギリシャ風',
+    western: true,
+    weight: 1.8,
+    syllables: ['ア', 'テ', 'ロ', 'ス', 'ミ', 'カ', 'リ', 'ノ', 'ペ', 'ラ', 'デ', 'オ', 'セ', 'ニ', 'ク', 'レ', 'ト', 'フィ', 'エ', 'ゼ', 'アル', 'メ', 'キ', 'ピ', 'ヘ'],
+    countrySuffix: ['ア', 'イア', 'ニア', 'オス', 'ス', 'ドス', 'ネ'],
+    citySuffix: ['ポリス', 'オン', 'ア', 'イオン', 'オス', 'ネ', 'ステ'],
+    govs: [['王国', 3], ['共和国', 3], ['都市同盟', 1.5], ['帝国', 1], ['専制公国', 1]],
+    subdivisions: ['州', '県', '管区'],
+  },
+  {
     key: 'desert',
-    label: '砂漠風',
+    label: '中東風',
+    western: false,
+    weight: 2,
     syllables: ['アル', 'ザ', 'カ', 'ハ', 'ラ', 'シャ', 'ム', 'ナ', 'ディ', 'ファ', 'ジャ', 'サ', 'ミ', 'バ', 'タ', 'リ', 'ク', 'ズ', 'ヤ', 'ハル', 'マル', 'ダル', 'スー', 'カー'],
     countrySuffix: ['スタン', 'ーン', 'ラ', 'ディア', 'ーム', 'ヤ', 'ール'],
     citySuffix: ['バード', 'ーン', 'ーラ', 'ダル', 'ハル', 'ーム', 'カンド', 'ーズ'],
@@ -55,6 +89,8 @@ export const CULTURES: readonly Culture[] = [
   {
     key: 'south',
     label: '南洋風',
+    western: false,
+    weight: 1.2,
     syllables: ['カ', 'ハ', 'ヌ', 'イ', 'マ', 'ロ', 'ア', 'ナ', 'ラ', 'ワ', 'ケ', 'オ', 'モ', 'ホ', 'ル', 'ティ', 'パ', 'ウ', 'リ', 'ミ', 'ヒ', 'ポ'],
     countrySuffix: ['', 'ア', 'ニ', 'ロア', 'ヌイ', 'ラニ'],
     citySuffix: ['', 'ア', 'ナ', 'ロ', 'ハ', 'ルア'],
@@ -64,6 +100,8 @@ export const CULTURES: readonly Culture[] = [
   {
     key: 'steppe',
     label: '草原風',
+    western: false,
+    weight: 1.2,
     syllables: ['ハン', 'テム', 'ボル', 'オル', 'ジン', 'カラ', 'バト', 'アル', 'タン', 'ウル', 'ゲ', 'セ', 'チ', 'ム', 'ダ', 'イル', 'ノ', 'ガ', 'ト', 'ス', 'ケレ', 'ヤク'],
     countrySuffix: ['', 'ル', 'ン', 'ト', 'ア', 'ガン'],
     citySuffix: ['バリク', 'クル', 'ゴル', 'ホト', 'タグ', 'オルド'],
@@ -74,6 +112,8 @@ export const CULTURES: readonly Culture[] = [
     key: 'wa',
     label: '和風',
     kanji: true,
+    western: false,
+    weight: 1.5,
     syllables: ['秋', '朝', '青', '葦', '天', '磐', '出', '大', '葛', '白', '高', '武', '筑', '豊', '日', '美', '真', '若', '伊', '那', '鳴', '霧', '雪', '月', '星', '雲', '鷹', '鶴', '桜', '藤', '紅', '黒', '金', '風', '岩', '八', '千', '久', '長', '早', '春', '夏', '冬', '東', '西', '南', '北', '新', '古', '清', '静', '吉', '香', '宮', '富', '福', '安', '平', '和', '嶺', '玉', '常', '駿', '越', '琴', '蒼', '茜', '翠'],
     tails: ['津', '原', '島', '野', '瀬', '沢', '谷', '浦', '崎', '浜', '岡', '田', '川', '森', '宮', '江', '根', '見', '洲', '磯', '尾', '生', '城', '戸', '波', '木', '杜', '霞', '守', '代', '海', '陽', '賀', '和', '路', '国', '州'],
     countrySuffix: [''],
@@ -161,16 +201,24 @@ export function subdivisionFor(rng: Rng, culture: Culture): string {
   return pick(rng, culture.subdivisions);
 }
 
-export function pickCulture(rng: Rng): Culture {
-  return pickWeighted(rng, [
-    [CULTURES[0], 3],
-    [CULTURES[1], 3],
-    [CULTURES[2], 2],
-    [CULTURES[3], 2],
-    [CULTURES[4], 1.2],
-    [CULTURES[5], 1.2],
-    [CULTURES[6], 1.5],
-  ]);
+/** 既定で使う命名文化（西洋系のみ） */
+export const WESTERN_CULTURES: readonly string[] = CULTURES.filter((c) => c.western).map((c) => c.key);
+
+/** 使ってよい命名文化（未指定・空なら西洋系）から、重みに従って選ぶ */
+export function pickCulture(rng: Rng, allowed: readonly string[] = WESTERN_CULTURES): Culture {
+  let list = CULTURES.filter((c) => allowed.includes(c.key));
+  if (list.length === 0) list = CULTURES.filter((c) => c.western);
+  return pickWeighted(
+    rng,
+    list.map((c) => [c, c.weight] as const),
+  );
+}
+
+/** 決まった値（シードなど）から、使ってよい命名文化を 1 つ選ぶ */
+export function cultureForSeed(seed: number, allowed: readonly string[] = WESTERN_CULTURES): Culture {
+  let list = CULTURES.filter((c) => allowed.includes(c.key));
+  if (list.length === 0) list = CULTURES.filter((c) => c.western);
+  return list[Math.abs(Math.floor(seed)) % list.length];
 }
 
 export type FeatureKind = 'range' | 'massif' | 'peak' | 'river' | 'plain' | 'basin' | 'plateau' | 'lake';
@@ -199,7 +247,7 @@ export const FEATURE_LABEL: Record<FeatureKind, string> = {
 
 export function featureName(rng: Rng, culture: Culture, kind: FeatureKind): string {
   const root = makeRoot(rng, culture, true);
-  if (kind === 'peak' && !culture.kanji && rng() < 0.4) return root + '岳';
+  if (kind === 'peak' && culture.kanji && rng() < 0.4) return root + '岳';
   if (kind === 'river' && rng() < 0.15) return root + '河';
   return root + FEATURE_SUFFIX[kind];
 }

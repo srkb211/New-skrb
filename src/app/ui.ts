@@ -320,7 +320,7 @@ export class AppUI {
     if (tool === 'outline') {
       opts.append(sliderRow('線の太さ', settings.pen, 0.5, 4, 0.1, (v) => v.toFixed(1), (v) => (settings.pen = v)));
     }
-    if (tool === 'land' || tool === 'sea' || tool === 'erase' || tool === 'ridge-erase' || tool === 'border-erase') {
+    if (tool === 'land' || tool === 'sea' || tool === 'erase' || tool === 'ridge-erase' || tool === 'border-erase' || tool === 'territory') {
       opts.append(sliderRow('ブラシの大きさ', settings.brush, 1, 40, 0.5, (v) => v.toFixed(1), (v) => (settings.brush = v)));
     }
     if (tool === 'fill') {
@@ -331,10 +331,12 @@ export class AppUI {
       opts.append(sel, sliderRow('隙間閉じ', settings.gap, 0, 6, 1, (v) => `${v} セル`, (v) => (settings.gap = v)));
       opts.append(h('p', { class: 'note' }, '輪郭線が少し途切れていても、隙間閉じの幅までは塞いでから塗ります。'));
     }
+    if (tool === 'territory') opts.append(...this.territoryOptions());
     if (tool === 'national' || tool === 'state') {
       opts.append(
         h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: settings.snap, onchange: (e: Event) => (settings.snap = (e.target as HTMLInputElement).checked) }), '端点を海岸・他の境界線へ自動でつなぐ'),
-        h('p', { class: 'note' }, '国境で囲まれた陸地が自動で「国」に、州境で区切られた範囲が「州」になります。名前は自動で付き、データタブで変更できます。'),
+        h('p', { class: 'note' }, '国境で囲まれた陸地が自動で「国」に、州境で区切られた範囲が「州」になります。線の両端は海か他の境界線まで届かせてください（届いていない端は赤い丸で表示されます）。'),
+        h('p', { class: 'note' }, '思った形にならないときは「領土ブラシ」で国の領土を直接塗り直すと確実です。'),
       );
     }
     if (tool === 'lasso') {
@@ -454,6 +456,7 @@ export class AppUI {
           },
         }, '国と州を自動生成'),
         h('p', { class: 'note' }, '山脈・大河・急斜面を越えにくいように領域を広げるので、地形に沿った国境になります。' + (w.terrain ? '' : '（地形を生成してからの方が自然になります）')),
+        this.cultureChooser(),
         h('div', { class: 'btn-row' },
           h('button', { class: 'btn small', disabled: liveCountries === 0, onclick: () => actions.renameAll(store) }, '国名・州名をすべて作り直す'),
           h('button', { class: 'btn small danger', disabled: w.borders.length === 0 && w.countries.length === 0, onclick: () => confirm('国境・州境と国のデータを消去しますか？') && actions.clearPolitical(store) }, '政治データを消去'),
@@ -563,7 +566,8 @@ export class AppUI {
       const subIn = h('input', { type: 'text', value: c.subdivision, onchange: () => actions.updateCountry(store, c.id, { subdivision: subIn.value.trim() }) });
       const colorIn = h('input', { type: 'color', value: c.color, onchange: () => actions.updateCountry(store, c.id, { color: colorIn.value }) });
       const cultureSel = h('select', { onchange: () => actions.updateCountry(store, c.id, { culture: cultureSel.value }) },
-        CULTURES.map((cu) => h('option', { value: cu.key, selected: cu.key === culture.key }, cu.label)));
+        h('optgroup', { label: '西洋系' }, CULTURES.filter((cu) => cu.western).map((cu) => h('option', { value: cu.key, selected: cu.key === culture.key }, cu.label))),
+        h('optgroup', { label: '西洋以外' }, CULTURES.filter((cu) => !cu.western).map((cu) => h('option', { value: cu.key, selected: cu.key === culture.key }, cu.label))));
       const myStates = stats.states.filter((st) => st.country === sel.index && st.cells > 0).sort((a, b) => b.area - a.area);
       const stateCountIn = h('input', { type: 'number', min: '1', max: '30', value: String(Math.max(1, myStates.length)), style: 'width:64px;flex:none' });
       // 選択セルを含む成分（島など）を別の国へ
@@ -602,7 +606,8 @@ export class AppUI {
           actions.moveComponentTo(store, sel.cell, Number(moveSel.value));
           store.select(null);
         } }, '編入')) : null,
-        h('p', { class: 'note' }, `命名文化：${culture.label}。国境で囲まれた範囲（タップした所を含む島や地域）を別の国に編入できます。`),
+        s.neighbors.size ? this.mergeRow('country', sel.index, [...s.neighbors.keys()].map((k) => ({ index: k, label: labels.countries[k].name + labels.countries[k].gov }))) : null,
+        h('p', { class: 'note' }, `命名文化：${culture.label}。国境で囲まれた範囲（タップした所を含む島や地域）を別の国に編入できます。国境の形は「領土ブラシ」で塗り直せます。`),
       );
     }
     const s = stats.states[sel.index];
@@ -631,7 +636,76 @@ export class AppUI {
         const foreign = oc !== s.country && oc >= 0 ? `（${labels.countries[oc].name}）` : '';
         return h('span', { class: 'chip', onclick: () => this.selectRegion('state', k) }, `${other.name}${foreign} ${fmtKm(len)}`);
       })),
+      this.mergeRow('state', sel.index, [...s.neighbors.keys()].filter((k) => stats.states[k].country === s.country).map((k) => ({ index: k, label: labels.states[k].name }))),
     );
+  }
+
+  /** 隣の国（州）をこの国（州）に統合する行 */
+  private mergeRow(kind: 'country' | 'state', keep: number, options: { index: number; label: string }[]): HTMLElement | null {
+    if (options.length === 0) return null;
+    const sel = h('select', {}, h('option', { value: '' }, kind === 'country' ? '統合する隣国を選ぶ…' : '統合する隣の州を選ぶ…'), options.map((o) => h('option', { value: String(o.index) }, o.label)));
+    return h('div', { class: 'row' }, h('label', {}, kind === 'country' ? '隣国を統合' : '隣の州を統合'), sel, h('button', { class: 'btn small', onclick: () => {
+      if (!sel.value) return;
+      actions.mergeAction(this.host.store, kind, keep, Number(sel.value));
+      this.toast('統合しました（元に戻すは Ctrl+Z）');
+    } }, '統合'));
+  }
+
+  /** 自動の命名に使う文化の選択（既定は西洋系のみ） */
+  private cultureChooser(): HTMLElement {
+    const { store } = this.host;
+    const chosen = new Set(store.world.nameCultures);
+    const box = (key: string, label: string) =>
+      h('label', { class: 'check' }, h('input', {
+        type: 'checkbox',
+        checked: chosen.has(key),
+        onchange: (e: Event) => {
+          const next = new Set(store.world.nameCultures);
+          if ((e.target as HTMLInputElement).checked) next.add(key);
+          else next.delete(key);
+          try {
+            actions.setNameCultures(store, CULTURES.filter((c) => next.has(c.key)).map((c) => c.key));
+          } catch (err) {
+            this.error(err);
+            this.renderPanel();
+          }
+        },
+      }), label);
+    const nonWestern = CULTURES.filter((c) => !c.western);
+    const usingNonWestern = nonWestern.some((c) => chosen.has(c.key));
+    return h('div', {},
+      h('div', { class: 'subhead' }, '名前に使う文化'),
+      h('div', { class: 'grid2' }, CULTURES.filter((c) => c.western).map((c) => box(c.key, c.label))),
+      h('details', { open: usingNonWestern }, h('summary', { class: 'note', style: 'cursor:pointer' }, '西洋以外の文化も使う'),
+        h('div', { class: 'grid2' }, nonWestern.map((c) => box(c.key, c.label)))),
+      h('p', { class: 'note' }, '新しく作る国・州・都市・地物の名前は、ここで選んだ文化からだけ作ります。既にある国で使わない文化のものは「名前をすべて作り直す」で選んだ文化に置き換わります。'),
+    );
+  }
+
+  private territoryOptions(): HTMLElement[] {
+    const { settings, store } = this.host;
+    const pol = store.political;
+    const level = h('div', { class: 'btn-row' });
+    for (const [v, label] of [['country', '国単位'], ['state', '州単位']] as const) {
+      level.append(h('button', { class: 'btn small' + (settings.territoryLevel === v ? ' primary' : ''), onclick: () => { settings.territoryLevel = v; this.renderPanel(); } }, label));
+    }
+    const target = h('select', { onchange: () => { settings.territoryTarget = target.value; } },
+      h('option', { value: 'start', selected: settings.territoryTarget === 'start' }, '描き始めた所の国（州）を広げる'),
+      h('option', { value: 'new', selected: settings.territoryTarget === 'new' }, '新しい国を作る'),
+      pol ? h('optgroup', { label: '国を指定' }, pol.labels.countries.map((c, k) => pol.stats.countries[k]?.cells > 0
+        ? h('option', { value: `c:${c.id}`, selected: settings.territoryTarget === `c:${c.id}` }, c.name + c.gov) : null)) : null,
+      pol ? h('optgroup', { label: '州を指定' }, pol.labels.states.map((s, k) => {
+        const st = pol.stats.states[k];
+        if (!st || st.cells === 0) return null;
+        const c = st.country >= 0 ? pol.labels.countries[st.country] : null;
+        return h('option', { value: `s:${s.id}`, selected: settings.territoryTarget === `s:${s.id}` }, `${s.name}${c?.subdivision ?? ''}（${c?.name ?? ''}）`);
+      })) : null,
+    );
+    return [
+      h('div', { class: 'row' }, h('label', {}, '塗る単位'), level),
+      h('div', { class: 'row' }, h('label', {}, '塗る先'), target),
+      h('p', { class: 'note' }, '塗った陸地はその国（州）の領土になり、国境・州境は塗った形に合わせて自動で引き直されます。新しい国も塗って作れます。元に戻すは Ctrl+Z。'),
+    ];
   }
 
   private pickButton(pick: PendingPick): HTMLElement {
@@ -1301,7 +1375,8 @@ export class AppUI {
     this.toastEl.classList.toggle('error', error);
     this.toastEl.classList.add('show');
     clearTimeout((this.toastEl as unknown as { _t: number })._t);
-    (this.toastEl as unknown as { _t: number })._t = window.setTimeout(() => this.toastEl.classList.remove('show'), error ? 5000 : 2600);
+    const ms = Math.max(error ? 5000 : 2600, msg.length * 90);
+    (this.toastEl as unknown as { _t: number })._t = window.setTimeout(() => this.toastEl.classList.remove('show'), ms);
   }
 
   error(e: unknown): void {

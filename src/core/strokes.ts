@@ -220,3 +220,60 @@ export function eraseOutline(paint: Uint8Array, w: number, h: number, cells: Ite
     paint[i] = landN > seaN ? PAINT_LAND : PAINT_SEA;
   }
 }
+
+export interface OpenEnd {
+  x: number;
+  y: number;
+  strokeId: number;
+  kind: 'national' | 'state';
+}
+
+/**
+ * 海岸（海）や他の境界線につながっていない線の端を探す。
+ * こうした端があると、その線は区画を分けない（途中で途切れた線として無視される）。
+ */
+export function openStrokeEnds(
+  borders: readonly { id: number; kind: 'national' | 'state'; points: Pt[] }[],
+  land: Uint8Array,
+  w: number,
+  h: number,
+): OpenEnd[] {
+  const n = w * h;
+  const ownerN = new Int32Array(n).fill(-1);
+  const ownerAll = new Int32Array(n).fill(-1);
+  borders.forEach((b, k) => {
+    rasterizePolyline(b.points, w, h, (i) => {
+      ownerAll[i] = ownerAll[i] === -1 || ownerAll[i] === k ? k : -2;
+      if (b.kind === 'national') ownerN[i] = ownerN[i] === -1 || ownerN[i] === k ? k : -2;
+    });
+  });
+  const out: OpenEnd[] = [];
+  borders.forEach((b, k) => {
+    const pts = b.points;
+    if (pts.length < 2) return;
+    const first = pts[0];
+    const last = pts[pts.length - 1];
+    if (Math.hypot(first[0] - last[0], first[1] - last[1]) <= 1.5) return;
+    const owner = b.kind === 'national' ? ownerN : ownerAll;
+    for (const p of [first, last]) {
+      const cx = Math.floor(p[0]);
+      const cy = Math.floor(p[1]);
+      let ok = false;
+      for (let dy = -1; dy <= 1 && !ok; dy++) {
+        for (let dx = -1; dx <= 1 && !ok; dx++) {
+          const x = cx + dx;
+          const y = cy + dy;
+          if (x < 0 || y < 0 || x >= w || y >= h) {
+            ok = true;
+            break;
+          }
+          const i = y * w + x;
+          if (!land[i]) ok = true;
+          else if (owner[i] !== -1 && owner[i] !== k) ok = true;
+        }
+      }
+      if (!ok) out.push({ x: p[0], y: p[1], strokeId: b.id, kind: b.kind });
+    }
+  });
+  return out;
+}

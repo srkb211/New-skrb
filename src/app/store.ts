@@ -143,6 +143,7 @@ export class Store {
         states: w.states,
         seed: w.seed,
         nextId: w.nextId,
+        cultures: w.nameCultures,
       });
       if (labels.addedCountries > 0 || labels.addedStates > 0) {
         this.world = { ...this.world, countries: labels.countries, states: labels.states, nextId: labels.nextId };

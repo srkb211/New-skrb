@@ -3,6 +3,7 @@ import { contourRings, maskRings } from '../core/contour';
 import { LF_LAKE } from '../core/landforms';
 import type { Pt } from '../core/raster';
 import { chaikin, simplify, type Ring } from '../core/topology';
+import { openStrokeEnds, type OpenEnd } from '../core/strokes';
 import { PAINT_LAND, PAINT_OUTLINE } from '../core/world';
 import { climateColor, type ClimateLayer } from './climate-style';
 import { COLORS, landColor, seaColor } from './palette';
@@ -115,6 +116,12 @@ export class MapLayers {
       }
     }
     ctx.putImageData(img, x0, y0);
+  }
+
+  /** 海岸や他の境界線につながっていない線の端 */
+  openEnds(): OpenEnd[] {
+    const { world, land } = this.store;
+    return this.cached('open-ends', [world.borders, land], () => openStrokeEnds(world.borders, land, world.width, world.height));
   }
 
   /** 気候レイヤーのラスタ（気候グリッドの解像度） */

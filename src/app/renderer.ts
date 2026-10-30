@@ -58,7 +58,13 @@ export interface DrawTransform {
 
 export interface Overlay {
   /** 描画中のストローク */
-  stroke?: { points: Pt[]; style: 'outline' | 'ridge' | 'national' | 'state' | 'lasso' | 'brush-land' | 'brush-sea' };
+  stroke?: {
+    points: Pt[];
+    style: 'outline' | 'ridge' | 'national' | 'state' | 'lasso' | 'brush-land' | 'brush-sea' | 'territory';
+    /** 領土ブラシ：塗る色と半径（セル） */
+    color?: string;
+    radius?: number;
+  };
   /** ブラシのカーソル（ワールド座標と半径） */
   cursor?: { x: number; y: number; r: number };
   /** ブラシ操作中の下絵 */
@@ -481,6 +487,21 @@ export class MapRenderer {
       ctx.lineWidth = (b.kind === 'national' ? 2 : 1.4) * u;
       this.polyline(ctx, b.points);
     }
+    // つながっていない線の端（ここが原因で区画が分かれない）
+    if (!list) {
+      for (const e of this.layers.openEnds()) {
+        ctx.beginPath();
+        ctx.arc(e.x, e.y, 6 * u, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(230, 30, 30, 0.25)';
+        ctx.fill();
+        ctx.lineWidth = 2 * u;
+        ctx.strokeStyle = '#ffffff';
+        ctx.stroke();
+        ctx.lineWidth = 1.2 * u;
+        ctx.strokeStyle = '#d61f1f';
+        ctx.stroke();
+      }
+    }
     ctx.restore();
   }
 
@@ -546,6 +567,16 @@ export class MapRenderer {
         ctx.strokeStyle = 'rgba(255, 170, 0, 0.95)';
         ctx.lineWidth = 2 * u;
         ctx.setLineDash([6 * u, 4 * u]);
+        break;
+      case 'territory':
+        ctx.globalAlpha = 0.55;
+        ctx.strokeStyle = s.color ?? '#999999';
+        ctx.lineWidth = Math.max(2 * u, (s.radius ?? 1) * 2);
+        this.polyline(ctx, s.points);
+        ctx.globalAlpha = 1;
+        ctx.strokeStyle = 'rgba(40, 30, 20, 0.6)';
+        ctx.lineWidth = 1 * u;
+        ctx.setLineDash([4 * u, 3 * u]);
         break;
       default:
         ctx.strokeStyle = 'rgba(40, 30, 20, 0.9)';

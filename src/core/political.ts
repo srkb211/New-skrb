@@ -15,6 +15,8 @@ export interface PoliticalInput {
   states: readonly StateRecord[];
   seed: number;
   nextId: number;
+  /** 新しい国の命名に使う文化（省略時は西洋系） */
+  cultures?: readonly string[];
 }
 
 export interface PoliticalLabels {
@@ -38,14 +40,87 @@ export function minStateCells(w: number, h: number): number {
   return Math.max(8, Math.round((w * h) / 9000));
 }
 
-export function rasterizeBorders(borders: readonly BorderStroke[], w: number, h: number) {
-  const national = new Uint8Array(w * h);
-  const state = new Uint8Array(w * h);
+export interface BorderRaster {
+  national: Uint8Array;
+  state: Uint8Array;
+  /** 国境セルを通る線分（1 本なら番号、無ければ -1、2 本以上なら -2 で segListNational に一覧） */
+  segNational: Int32Array;
+  /** 国境・州境を合わせた線分 */
+  segAll: Int32Array;
+  segListNational: Map<number, number[]>;
+  segListAll: Map<number, number[]>;
+  /** 線分の座標 [ax, ay, bx, by, ...] */
+  segs: number[];
+}
+
+/**
+ * 境界線を 4 連結の 1 セル幅で塗る。各セルを通る線分も記録し、
+ * あとで「線をまたがない隣」からだけ区画を受け取れるようにする。
+ */
+export function rasterizeBorders(borders: readonly BorderStroke[], w: number, h: number): BorderRaster {
+  const n = w * h;
+  const national = new Uint8Array(n);
+  const state = new Uint8Array(n);
+  const segNational = new Int32Array(n).fill(-1);
+  const segAll = new Int32Array(n).fill(-1);
+  const segListNational = new Map<number, number[]>();
+  const segListAll = new Map<number, number[]>();
+  const segs: number[] = [];
+  const record = (arr: Int32Array, lists: Map<number, number[]>, i: number, seg: number) => {
+    const cur = arr[i];
+    if (cur === -1) arr[i] = seg;
+    else if (cur >= 0) {
+      if (cur !== seg) {
+        lists.set(i, [cur, seg]);
+        arr[i] = -2;
+      }
+    } else {
+      const list = lists.get(i)!;
+      if (!list.includes(seg)) list.push(seg);
+    }
+  };
   for (const b of borders) {
-    const target = b.kind === 'national' ? national : state;
-    rasterizePolyline(b.points, w, h, (i) => (target[i] = 1));
+    const nat = b.kind === 'national';
+    const target = nat ? national : state;
+    const pts = b.points;
+    if (pts.length === 1) {
+      rasterizePolyline(pts, w, h, (i) => (target[i] = 1));
+      continue;
+    }
+    for (let k = 1; k < pts.length; k++) {
+      const seg = segs.length / 4;
+      segs.push(pts[k - 1][0], pts[k - 1][1], pts[k][0], pts[k][1]);
+      rasterizePolyline([pts[k - 1], pts[k]], w, h, (i) => {
+        target[i] = 1;
+        record(segAll, segListAll, i, seg);
+        if (nat) record(segNational, segListNational, i, seg);
+      });
+    }
   }
-  return { national, state };
+  return { national, state, segNational, segAll, segListNational, segListAll, segs };
+}
+
+function orient(ax: number, ay: number, bx: number, by: number, cx: number, cy: number): number {
+  const v = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+  return v > 1e-12 ? 1 : v < -1e-12 ? -1 : 0;
+}
+
+function onSeg(ax: number, ay: number, bx: number, by: number, px: number, py: number): boolean {
+  return Math.min(ax, bx) - 1e-12 <= px && px <= Math.max(ax, bx) + 1e-12 && Math.min(ay, by) - 1e-12 <= py && py <= Math.max(ay, by) + 1e-12;
+}
+
+/** 線分 pq と線分 ab が交わる（接する場合も含む）か */
+function segmentsCross(px: number, py: number, qx: number, qy: number, ax: number, ay: number, bx: number, by: number): boolean {
+  const o1 = orient(px, py, qx, qy, ax, ay);
+  const o2 = orient(px, py, qx, qy, bx, by);
+  const o3 = orient(ax, ay, bx, by, px, py);
+  const o4 = orient(ax, ay, bx, by, qx, qy);
+  if (o1 !== o2 && o3 !== o4) return true;
+  if (o1 === 0 && onSeg(px, py, qx, qy, ax, ay)) return true;
+  if (o2 === 0 && onSeg(px, py, qx, qy, bx, by)) return true;
+  if (o3 === 0 && onSeg(ax, ay, bx, by, px, py)) return true;
+  if (o4 === 0 && onSeg(ax, ay, bx, by, qx, qy)) return true;
+  return false;
 }
 
 /** 代表点から、近くの「有効なセル」を探す（代表点が境界線や海に落ちた場合の救済） */
@@ -67,8 +142,8 @@ function snapAnchor(p: Pt, w: number, h: number, ok: (i: number) => boolean, rad
   return -1;
 }
 
-/** 成分の内部にある代表点（境界から最も遠いセル） */
-function interiorPoints(labels: Int32Array, count: number, w: number, h: number): Int32Array {
+/** 成分の内部にある代表点（境界から最も遠いセル）と、そこから境界までの距離 */
+function interiorPoints(labels: Int32Array, count: number, w: number, h: number): { best: Int32Array; depth: Float32Array } {
   const dist = distanceTransform((i) => {
     const l = labels[i];
     if (l < 0) return true;
@@ -83,7 +158,26 @@ function interiorPoints(labels: Int32Array, count: number, w: number, h: number)
     const l = labels[i];
     if (l >= 0 && (best[l] < 0 || dist[i] > dist[best[l]])) best[l] = i;
   }
-  return best;
+  const depth = new Float32Array(count);
+  for (let l = 0; l < count; l++) depth[l] = best[l] >= 0 ? dist[best[l]] : 0;
+  return { best, depth };
+}
+
+/** 境界線で意図的に囲んだとみなす最小の大きさ（これより細い・小さい切れ端は隣に吸収する） */
+const ENCLOSED_MIN_CELLS = 12;
+const ENCLOSED_MIN_DEPTH = 2;
+
+/** 成分ごとに、境界線のセルに接しているか */
+function touchesBarrier(comps: Int32Array, count: number, barrier: (i: number) => boolean, w: number, h: number): Uint8Array {
+  const out = new Uint8Array(count);
+  const n = w * h;
+  for (let i = 0; i < n; i++) {
+    const c = comps[i];
+    if (c < 0 || out[c]) continue;
+    const x = i % w;
+    if ((x > 0 && barrier(i - 1)) || (x < w - 1 && barrier(i + 1)) || (i >= w && barrier(i - w)) || (i < n - w && barrier(i + w))) out[c] = 1;
+  }
+  return out;
 }
 
 const toPt = (i: number, w: number): Pt => [i % w, Math.floor(i / w)];
@@ -118,14 +212,17 @@ export function derivePolitical(input: PoliticalInput): PoliticalLabels {
   const minC = minCountryCells(w, h);
   let addedCountries = 0;
   const interiorN = interiorPoints(compN.labels, compN.count, w, h);
+  const touchN = touchesBarrier(compN.labels, compN.count, (i) => land[i] === 1 && bars.national[i] === 1, w, h);
   const compOrder = [...Array(compN.count).keys()].sort((a, b) => compN.sizes[b] - compN.sizes[a]);
   for (const comp of compOrder) {
     if (compCountry[comp] >= 0) continue;
     const big = compN.sizes[comp] >= minC;
     const none = countries.length === 0;
-    if (!big && !none) continue;
-    const anchor = toPt(interiorN[comp], w);
-    countries.push(makeCountry(seed, nextId++, anchor, reg));
+    // 国境で囲んだ小さな国（細い切れ端は除く）
+    const enclosed = touchN[comp] === 1 && compN.sizes[comp] >= ENCLOSED_MIN_CELLS && interiorN.depth[comp] >= ENCLOSED_MIN_DEPTH;
+    if (!big && !none && !enclosed) continue;
+    const anchor = toPt(interiorN.best[comp], w);
+    countries.push(makeCountry(seed, nextId++, anchor, reg, input.cultures));
     compCountry[comp] = countries.length - 1;
     addedCountries++;
   }
@@ -134,7 +231,9 @@ export function derivePolitical(input: PoliticalInput): PoliticalLabels {
     const comp = compN.labels[i];
     if (comp >= 0) country[i] = compCountry[comp];
   }
-  absorb(country, land, w, h, () => true);
+  absorb(country, land, w, h, () => true, { seg: bars.segNational, lists: bars.segListNational, segs: bars.segs });
+  // 海の上に引いた国境線は、小島がどちらの国に属するかの区切りになる
+  assignStrays(country, land, w, h, (i) => bars.national[i] === 1 && !land[i]);
   assignStrays(country, land, w, h);
 
   // ---- 州 ----
@@ -156,6 +255,7 @@ export function derivePolitical(input: PoliticalInput): PoliticalLabels {
   });
   const minS = minStateCells(w, h);
   const interiorS = interiorPoints(compS.labels, compS.count, w, h);
+  const touchS = touchesBarrier(compS.labels, compS.count, (i) => land[i] === 1 && (bars.state[i] === 1 || bars.national[i] === 1), w, h);
   const compCountryS = new Int32Array(compS.count).fill(-1);
   for (let i = 0; i < n; i++) if (compS.labels[i] >= 0) compCountryS[compS.labels[i]] = country[i];
   const hasState = new Uint8Array(countries.length);
@@ -165,9 +265,10 @@ export function derivePolitical(input: PoliticalInput): PoliticalLabels {
   for (const comp of orderS) {
     if (compState[comp] >= 0) continue;
     const ci = compCountryS[comp];
-    if (compS.sizes[comp] < minS && hasState[ci]) continue;
+    const enclosed = touchS[comp] === 1 && compS.sizes[comp] >= ENCLOSED_MIN_CELLS && interiorS.depth[comp] >= ENCLOSED_MIN_DEPTH;
+    if (compS.sizes[comp] < minS && hasState[ci] && !enclosed) continue;
     const culture = cultureByKey(countries[ci].culture);
-    const anchor = toPt(interiorS[comp], w);
+    const anchor = toPt(interiorS.best[comp], w);
     const rng = rngFor(seed, 7, anchor[0], anchor[1]);
     states.push({ id: nextId++, name: regionName(rng, culture, reg), seat: cityName(rng, culture, reg), anchors: [anchor] });
     compState[comp] = states.length - 1;
@@ -179,15 +280,15 @@ export function derivePolitical(input: PoliticalInput): PoliticalLabels {
     const comp = compS.labels[i];
     if (comp >= 0) state[i] = compState[comp];
   }
-  absorb(state, land, w, h, (a, b) => country[a] === country[b]);
+  absorb(state, land, w, h, (a, b) => country[a] === country[b], { seg: bars.segAll, lists: bars.segListAll, segs: bars.segs });
   assignStraysWithin(state, country, w, h);
 
   return { country, state, countries, states, addedCountries, addedStates, nextId };
 }
 
-export function makeCountry(seed: number, id: number, anchor: Pt, reg = newRegistry()): CountryRecord {
+export function makeCountry(seed: number, id: number, anchor: Pt, reg = newRegistry(), cultures?: readonly string[]): CountryRecord {
   const rng = rngFor(seed, 3, anchor[0], anchor[1]);
-  const culture = pickCulture(rng);
+  const culture = pickCulture(rng, cultures);
   return {
     id,
     name: countryName(rng, culture, reg),
@@ -200,38 +301,63 @@ export function makeCountry(seed: number, id: number, anchor: Pt, reg = newRegis
   };
 }
 
-/** 未割当の陸セル（境界線上など）を、隣接する割当済みセルから幅優先で埋める */
+/**
+ * 未割当の陸セル（境界線上など）を、隣接する割当済みセルから幅優先で埋める。
+ * sides があれば 1 周目は「セル中心どうしを結ぶ線が境界線をまたがない」隣からだけ受け取る。
+ * これで区画の境目が、描いた線のどちら側に寄ることもなく線そのものに沿う。
+ */
 function absorb(
   labels: Int32Array,
   land: Uint8Array,
   w: number,
   h: number,
   allowed: (from: number, to: number) => boolean,
+  sides?: { seg: Int32Array; lists: Map<number, number[]>; segs: number[] },
 ): void {
   const n = w * h;
   const queue = new Int32Array(n);
-  let head = 0;
-  let tail = 0;
-  for (let i = 0; i < n; i++) if (labels[i] >= 0) queue[tail++] = i;
-  while (head < tail) {
-    const i = queue[head++];
-    const x = i % w;
-    const l = labels[i];
-    const visit = (j: number) => {
-      if (labels[j] < 0 && land[j] && allowed(i, j)) {
+  const segsAt = (c: number): number[] | null => {
+    const s = sides!.seg[c];
+    return s >= 0 ? [s] : s === -2 ? sides!.lists.get(c) ?? null : null;
+  };
+  const crosses = (i: number, j: number): boolean => {
+    const px = (i % w) + 0.5;
+    const py = Math.floor(i / w) + 0.5;
+    const qx = (j % w) + 0.5;
+    const qy = Math.floor(j / w) + 0.5;
+    const S = sides!.segs;
+    for (const list of [segsAt(i), segsAt(j)]) {
+      if (!list) continue;
+      for (const k of list) {
+        if (segmentsCross(px, py, qx, qy, S[k * 4], S[k * 4 + 1], S[k * 4 + 2], S[k * 4 + 3])) return true;
+      }
+    }
+    return false;
+  };
+  for (const constrained of sides ? [true, false] : [false]) {
+    let head = 0;
+    let tail = 0;
+    for (let i = 0; i < n; i++) if (labels[i] >= 0) queue[tail++] = i;
+    while (head < tail) {
+      const i = queue[head++];
+      const x = i % w;
+      const l = labels[i];
+      const visit = (j: number) => {
+        if (labels[j] >= 0 || !land[j] || !allowed(i, j)) return;
+        if (constrained && crosses(i, j)) return;
         labels[j] = l;
         queue[tail++] = j;
-      }
-    };
-    if (x > 0) visit(i - 1);
-    if (x < w - 1) visit(i + 1);
-    if (i >= w) visit(i - w);
-    if (i < n - w) visit(i + w);
+      };
+      if (x > 0) visit(i - 1);
+      if (x < w - 1) visit(i + 1);
+      if (i >= w) visit(i - w);
+      if (i < n - w) visit(i + w);
+    }
   }
 }
 
-/** まだ未割当の陸（小島）を、海を越えて最も近い区画に属させる */
-function assignStrays(labels: Int32Array, land: Uint8Array, w: number, h: number): void {
+/** まだ未割当の陸（小島）を、海を越えて最も近い区画に属させる（block のセルは越えない） */
+function assignStrays(labels: Int32Array, land: Uint8Array, w: number, h: number, block?: (i: number) => boolean): void {
   const n = w * h;
   let stray = false;
   for (let i = 0; i < n; i++) if (land[i] && labels[i] < 0) stray = true;
@@ -247,7 +373,7 @@ function assignStrays(labels: Int32Array, land: Uint8Array, w: number, h: number
     const x = i % w;
     const l = near[i];
     const visit = (j: number) => {
-      if (near[j] < 0) {
+      if (near[j] < 0 && !(block && block(j))) {
         near[j] = l;
         queue[tail++] = j;
       }

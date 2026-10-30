@@ -2,11 +2,11 @@ import { mapScale } from '../core/coast';
 import type { ClimateData, ClimateParams } from '../core/climate';
 import type { GeoFrame } from '../core/geoframe';
 import type { FeatureKind } from '../core/names';
-import { regenerateCountryStates, reassignComponent, renameCountry } from '../core/edits';
+import { mergeRegions, paintTerritory, regenerateCountryStates, reassignComponent, renameCountry, type TerritoryTarget } from '../core/edits';
 import { stampPolyline, type Pt } from '../core/raster';
 import { randomSeed } from '../core/rng';
 import { sampleSketch } from '../core/sample';
-import { cleanStroke, fillPaint, snapBorderStroke } from '../core/strokes';
+import { cleanStroke, fillPaint, openStrokeEnds, snapBorderStroke } from '../core/strokes';
 import { createWorld, landFromCoast, landFromPaint, PAINT_LAND, PAINT_SEA, type BorderKind, type CountryRecord, type GenParams, type StateRecord, type Stroke, type TerrainLayers, type WorldState } from '../core/world';
 import type { Store } from './store';
 
@@ -150,12 +150,35 @@ export function addRidge(store: Store, raw: Pt[]): Promise<void> {
   return setRidges(store, [...store.world.ridges, ridge], [pts]);
 }
 
-export function addBorder(store: Store, kind: BorderKind, raw: Pt[], snapRadius: number, snap: boolean): void {
+/** 区画の数（領域のあるものだけ） */
+function liveRegions(store: Store): { countries: number; states: number } {
+  const st = store.political?.stats;
+  return {
+    countries: st ? st.countries.filter((s) => s.cells > 0).length : 0,
+    states: st ? st.states.filter((s) => s.cells > 0).length : 0,
+  };
+}
+
+/**
+ * 境界線を追加する。区画が変わらなかったとき（線の端が海岸や他の線に届いていないなど）は
+ * 利用者に知らせる文を返す。
+ */
+export function addBorder(store: Store, kind: BorderKind, raw: Pt[], snapRadius: number, snap: boolean): string | null {
   const { world, land } = store;
   let pts = cleanStroke(raw, 0.4, 0.45);
-  if (pts.length < 2) return;
+  if (pts.length < 2) return null;
   if (snap) pts = snapBorderStroke(pts, land, world.borders, world.width, world.height, snapRadius);
-  store.commit({ ...world, borders: [...world.borders, { id: world.nextId, kind, points: pts }], nextId: world.nextId + 1 });
+  const before = liveRegions(store);
+  const id = world.nextId;
+  store.commit({ ...world, borders: [...world.borders, { id, kind, points: pts }], nextId: world.nextId + 1 });
+  const after = liveRegions(store);
+  const changed = kind === 'national' ? after.countries !== before.countries : after.states !== before.states;
+  if (changed) return null;
+  const open = openStrokeEnds(store.world.borders, store.land, world.width, world.height).filter((e) => e.strokeId === id);
+  if (open.length > 0) {
+    return `線の端（赤い丸）が海岸や他の${kind === 'national' ? '国境' : '境界線'}に届いていないため、区画は分かれていません。端を海や線の上まで伸ばしてください。`;
+  }
+  return null;
 }
 
 export async function autoPolitical(store: Store, countries: number, statesPerCountry: number): Promise<void> {
@@ -174,7 +197,7 @@ export async function autoPolitical(store: Store, countries: number, statesPerCo
         acc: analysis?.hydrology.acc ?? null,
         riverThreshold: analysis?.hydrology.riverThreshold ?? 0,
       },
-      opts: { countries, statesPerCountry, seed },
+      opts: { countries, statesPerCountry, seed, cultures: world.nameCultures },
       startId: world.nextId,
     }),
   );
@@ -224,11 +247,34 @@ export function renameCountryAction(store: Store, id: number): void {
   store.commit(renameCountry(store.world, id, randomSeed(), store.political?.labels));
 }
 
+/** 自動の命名に使う文化を設定する（空にはしない） */
+export function setNameCultures(store: Store, cultures: string[]): void {
+  if (cultures.length === 0) throw new Error('少なくとも 1 つの命名文化を選んでください');
+  store.commit({ ...store.world, nameCultures: cultures });
+}
+
 export function renameAll(store: Store): void {
   let world = store.world;
   const v = randomSeed();
   for (const c of world.countries) world = renameCountry(world, c.id, v + c.id, store.political?.labels);
   store.commit(world);
+}
+
+/** 領土ブラシ：塗った陸のセルを対象の国（州）の領土にする */
+export function paintTerritoryAction(store: Store, cells: number[], target: TerritoryTarget): boolean {
+  const { world, land, political } = store;
+  if (!political) return false;
+  const next = paintTerritory(world, land, political.labels, cells, target);
+  if (next === world) return false;
+  store.commit(next);
+  return true;
+}
+
+/** 国（または同じ国の州）を統合する。absorb の領域が keep に加わる */
+export function mergeAction(store: Store, kind: 'country' | 'state', keep: number, absorb: number): void {
+  const { world, land, political } = store;
+  if (!political) return;
+  store.commit(mergeRegions(world, land, political.labels, kind, keep, absorb));
 }
 
 export function moveComponentTo(store: Store, cell: number, countryId: number): void {

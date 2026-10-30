@@ -12,6 +12,7 @@ const P: Record<string, string> = {
   national: '<path d="M3 18c4-1 4-8 9-9s5-5 9-6" stroke-dasharray="6 2 1.5 2"/>',
   state: '<path d="M3 18c4-1 4-8 9-9s5-5 9-6" stroke-dasharray="3 3"/>',
   'border-erase': '<path d="M3 18c4-1 4-8 9-9" stroke-dasharray="4 2"/><path d="M15 12l6 6M21 12l-6 6"/>',
+  territory: '<path d="M4 6l6-2 5 3 5-1v12l-5 1-5-3-6 2z" fill="currentColor" fill-opacity=".25"/><path d="M10 4v13M15 7v13"/>',
   select: '<path d="M5 3l12 6-5 2-2 5z"/><path d="M12 11l6 6"/>',
   inspect: '<circle cx="12" cy="10" r="3"/><path d="M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11z"/>',
   climate: '<path d="M7 18a4 4 0 0 1 0-8 5 5 0 0 1 9.6-1.5A3.5 3.5 0 1 1 17 18z"/>',

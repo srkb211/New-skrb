@@ -1,5 +1,5 @@
 import type { Feature } from '../core/landforms';
-import { cultureByKey, featureName, type FeatureKind } from '../core/names';
+import { cultureByKey, cultureForSeed, featureName, type FeatureKind } from '../core/names';
 import { rngFor } from '../core/rng';
 import type { FeatureNameOverride } from '../core/world';
 import type { Store } from './store';
@@ -37,11 +37,12 @@ export function featureOverride(store: Store, f: Feature): FeatureNameOverride |
 /** 自動で付く名前（その場所の国の命名文化で、決定的に作る） */
 export function featureAutoName(store: Store, f: Feature): string {
   const { world, political } = store;
-  let culture = cultureByKey(['west', 'north', 'east', 'wa'][world.seed % 4]);
+  // 国に属さない場所や、使わない設定にした文化の国では、世界設定の文化から選ぶ
+  let culture = cultureForSeed(world.seed, world.nameCultures);
   if (political) {
     const c = political.labels.country[f.key];
     const rec = c >= 0 ? political.labels.countries[c] : null;
-    if (rec) culture = cultureByKey(rec.culture);
+    if (rec && world.nameCultures.includes(rec.culture)) culture = cultureByKey(rec.culture);
   }
   const rng = rngFor(world.seed, 555, f.key, kindCode(f.kind));
   return featureName(rng, culture, f.kind);
